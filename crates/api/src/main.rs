@@ -359,11 +359,13 @@ async fn main() -> Result<()> {
         .await
         .context("failed to bind API listener")?;
 
+    let (persistence_shutdown_tx, persistence_shutdown_rx) = tokio::sync::oneshot::channel();
+    let mut persistence_shutdown_tx = Some(persistence_shutdown_tx);
     let persistence_task = device_store.map(|store| {
         let runtime = runtime.clone();
         let health = health.clone();
         tokio::spawn(async move {
-            run_persistence_worker(runtime, store, health).await;
+            run_persistence_worker(runtime, store, health, persistence_shutdown_rx).await;
         })
     });
 
@@ -401,7 +403,9 @@ async fn main() -> Result<()> {
     let _ = automation_task.await;
 
     if let Some(task) = persistence_task {
-        task.abort();
+        if let Some(shutdown) = persistence_shutdown_tx.take() {
+            let _ = shutdown.send(());
+        }
         let _ = task.await;
     }
 
@@ -500,11 +504,38 @@ async fn monitor_runtime_health(runtime: Arc<Runtime>, health: HealthState) {
     let _ = monitor_task.await;
 }
 
-async fn run_persistence_worker(runtime: Arc<Runtime>, store: Arc<dyn DeviceStore>, health: HealthState) {
+async fn run_persistence_worker(
+    runtime: Arc<Runtime>,
+    store: Arc<dyn DeviceStore>,
+    health: HealthState,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) {
     let mut receiver = runtime.bus().subscribe();
+    tokio::pin!(shutdown);
 
     loop {
-        match receiver.recv().await {
+        let event = tokio::select! {
+            _ = &mut shutdown => {
+                if let Err(error) = reconcile_device_store(
+                    runtime.registry().list_rooms(),
+                    runtime.registry().list(),
+                    store.clone(),
+                )
+                .await
+                {
+                    health.persistence_error(format!(
+                        "failed to flush persisted registry state during shutdown: {error}"
+                    ));
+                    tracing::error!(error = %error, "failed to flush persisted registry state during shutdown");
+                } else {
+                    health.persistence_ok();
+                }
+                break;
+            }
+            event = receiver.recv() => event,
+        };
+
+        match event {
             Ok(Event::DeviceAdded { device }) => {
                 if let Err(error) = store.save_device(&device).await {
                     health.persistence_error(format!("failed to persist added device '{}': {error}", device.id.0));
@@ -1959,12 +1990,13 @@ mod tests {
                 event_bus_capacity: 16,
             },
         ));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let persistence_task = {
             let runtime = runtime.clone();
             let store: Arc<dyn DeviceStore> = store.clone();
             let health = HealthState::new(&[], true, false);
             tokio::spawn(async move {
-                run_persistence_worker(runtime, store, health).await;
+                run_persistence_worker(runtime, store, health, shutdown_rx).await;
             })
         };
         tokio::task::yield_now().await;
@@ -2015,8 +2047,62 @@ mod tests {
 
         assert_eq!(restarted_runtime.registry().list(), vec![device]);
 
-        persistence_task.abort();
+        let _ = shutdown_tx.send(());
         let _ = persistence_task.await;
+    }
+
+    #[tokio::test]
+    async fn persistence_worker_flushes_current_registry_state_on_shutdown() {
+        let database_url = temp_sqlite_url();
+        let store = Arc::new(
+            SqliteDeviceStore::new(&database_url, true)
+                .await
+                .expect("sqlite store initializes"),
+        );
+
+        let runtime = Arc::new(Runtime::new(
+            Vec::new(),
+            RuntimeConfig {
+                event_bus_capacity: 16,
+            },
+        ));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let persistence_task = {
+            let runtime = runtime.clone();
+            let store: Arc<dyn DeviceStore> = store.clone();
+            let health = HealthState::new(&[], true, false);
+            tokio::spawn(async move {
+                run_persistence_worker(runtime, store, health, shutdown_rx).await;
+            })
+        };
+        tokio::task::yield_now().await;
+
+        let room = Room {
+            id: RoomId("living_room".to_string()),
+            name: "Living Room".to_string(),
+        };
+        runtime.registry().upsert_room(room.clone()).await;
+
+        let mut device = sample_device(
+            "test:shutdown",
+            TEMPERATURE_OUTDOOR,
+            measurement_value(19.5, "celsius"),
+        );
+        device.room_id = Some(RoomId("living_room".to_string()));
+        runtime
+            .registry()
+            .upsert(device.clone())
+            .await
+            .expect("device upsert succeeds");
+
+        let _ = shutdown_tx.send(());
+        let _ = persistence_task.await;
+
+        assert_eq!(store.load_all_rooms().await.expect("rooms load"), vec![room]);
+        assert_eq!(
+            store.load_all_devices().await.expect("devices load"),
+            vec![device]
+        );
     }
 
     #[tokio::test]
