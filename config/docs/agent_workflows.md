@@ -32,6 +32,7 @@ When an agent starts work, it should usually inspect:
 
 - `README.md`
 - `config/docs/api_reference.md`
+- `config/docs/lua_runtime_guide.md`
 - `config/docs/adapter_authoring_guide.md`
 - `crates/core/src/adapter.rs`
 - `crates/core/src/capability.rs`
@@ -101,6 +102,19 @@ Example:
 Use `POST /rooms/{id}/command`.
 
 This is useful for agent-driven orchestration because it produces a per-device result array.
+
+### Author Lua assets
+
+Use:
+
+- `config/scenes/` for manual user-invoked flows
+- `config/automations/` for trigger-driven flows
+- `config/docs/lua_runtime_guide.md` for the current contract
+
+Current automation trigger types:
+
+- `device_state_change`
+- `interval`
 
 ## Adding A New Adapter
 

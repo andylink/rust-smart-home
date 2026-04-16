@@ -1,16 +1,17 @@
 [package]
-name = "smart-home-scenes"
+name = "smart-home-automations"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
 mlua = { version = "0.10", features = ["lua54", "vendored"] }
 serde = { version = "1", features = ["derive"] }
 smart-home-core = { path = "../core" }
 smart-home-lua-host = { path = "../lua-host" }
+tokio = { version = "1", features = ["sync", "time"] }
+tracing = "0.1"
 
 [dev-dependencies]
 async-trait = "0.1"
-chrono = { version = "0.4", features = ["serde"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

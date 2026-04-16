@@ -1,5 +1,8 @@
 # Smart Home Lua Scenes Implementation Plan
 
+> Status: historical implementation plan.
+> For the current runtime contract covering both scenes and automations, use `config/docs/lua_runtime_guide.md`.
+
 > **Goal:** Add file-backed scenes implemented in Lua with a structured module contract.
 > **First asset:** `Video` scene that turns off `roku_tv:tv` and turns on `elgato_lights:light:0`.
 > **Chosen scene contract:** each scene file returns `{ id, name, execute = function(ctx) ... end }`.

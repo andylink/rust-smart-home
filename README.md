@@ -17,10 +17,11 @@ Start here depending on your goal:
 
 - run the system: `config/default.toml`
 - use the API: `config/docs/api_reference.md`
+- write Lua scenes and automations: `config/docs/lua_runtime_guide.md`
 - build a new adapter: `config/docs/adapter_authoring_guide.md`
 - operate as an agent in this repo: `config/docs/agent_workflows.md`
 - understand why the factory model exists: `config/docs/adapter_factory_refactor_plan.md`
-- implement Lua-backed scenes: `config/docs/lua_scenes_implementation_plan.md`
+- see the original scene implementation plan: `config/docs/lua_scenes_implementation_plan.md`
 
 Adapter-specific docs:
 
@@ -28,6 +29,10 @@ Adapter-specific docs:
 - `crates/adapter-elgato-lights/README.md`
 - `crates/adapter-ollama/README.md`
 - `crates/adapter-roku-tv/README.md`
+
+Lua runtime docs:
+
+- `config/docs/lua_runtime_guide.md`
 
 ## Workspace Layout
 
@@ -348,6 +353,36 @@ local result = ctx:invoke("ollama:chat", {
 })
 
 local reply = result.message.content
+```
+
+Automations live in `config/automations/` and support two trigger types in the first pass:
+
+- `device_state_change`
+- `interval`
+
+Automation example:
+
+```lua
+return {
+  id = "hourly_summary",
+  name = "Hourly Summary",
+  trigger = {
+    type = "interval",
+    every_secs = 3600,
+  },
+  execute = function(ctx, event)
+    local result = ctx:invoke("ollama:chat", {
+      messages = {
+        {
+          role = "user",
+          content = "Summarize the current home status in one sentence.",
+        },
+      },
+    })
+
+    local summary = result.message.content
+  end
+}
 ```
 
 ## Event Model

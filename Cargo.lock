@@ -121,6 +121,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smart-home-adapters",
+ "smart-home-automations",
  "smart-home-core",
  "smart-home-scenes",
  "store-sql",
@@ -1321,7 +1322,6 @@ checksum = "c1f5f8fbebc7db5f671671134b9321c4b9aa9adeafccfd9a8c020ae45c6a35d0"
 dependencies = [
  "bstr",
  "either",
- "futures-util",
  "mlua-sys",
  "num-traits",
  "parking_lot",
@@ -2092,6 +2092,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "smart-home-automations"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "mlua",
+ "serde",
+ "smart-home-core",
+ "smart-home-lua-host",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "smart-home-core"
 version = "0.1.0"
 dependencies = [
@@ -2107,6 +2122,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "smart-home-lua-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mlua",
+ "smart-home-core",
+ "tokio",
+]
+
+[[package]]
 name = "smart-home-scenes"
 version = "0.1.0"
 dependencies = [
@@ -2116,6 +2141,7 @@ dependencies = [
  "mlua",
  "serde",
  "smart-home-core",
+ "smart-home-lua-host",
  "tokio",
 ]
 

@@ -12,6 +12,8 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use smart_home_adapters as _;
+use smart_home_automations::AutomationCatalog;
+use smart_home_automations::AutomationRunner;
 use smart_home_core::adapter::{registered_adapter_factories, Adapter};
 use smart_home_core::command::DeviceCommand;
 use smart_home_core::config::{Config, PersistenceBackend};
@@ -120,6 +122,20 @@ async fn main() -> Result<()> {
     } else {
         Arc::new(SceneCatalog::empty())
     };
+    let automations = if config.automations.enabled {
+        Arc::new(
+            AutomationCatalog::load_from_directory(&config.automations.directory).with_context(
+                || {
+                    format!(
+                        "failed to load automations from {}",
+                        config.automations.directory
+                    )
+                },
+            )?,
+        )
+    } else {
+        Arc::new(AutomationCatalog::empty())
+    };
 
     if let Some(store) = &device_store {
         let rooms = store
@@ -161,6 +177,15 @@ async fn main() -> Result<()> {
             runtime.run().await;
         })
     };
+    let automation_task = {
+        let runtime = runtime.clone();
+        let automations = automations.clone();
+        tokio::spawn(async move {
+            AutomationRunner::new((*automations).clone())
+                .run(runtime)
+                .await;
+        })
+    };
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
@@ -171,6 +196,9 @@ async fn main() -> Result<()> {
 
     runtime_task.abort();
     let _ = runtime_task.await;
+
+    automation_task.abort();
+    let _ = automation_task.await;
 
     if let Some(task) = persistence_task {
         task.abort();

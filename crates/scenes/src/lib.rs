@@ -1,19 +1,13 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use mlua::{Function, Lua, Table, UserData, UserDataMethods, Value};
+use mlua::{Function, Lua};
 use serde::Serialize;
-use smart_home_core::command::DeviceCommand;
-use smart_home_core::invoke::InvokeRequest;
-use smart_home_core::model::{AttributeValue, DeviceId};
 use smart_home_core::runtime::Runtime;
-use tokio::runtime::Handle;
-use tokio::task::block_in_place;
+use smart_home_lua_host::{evaluate_module, CommandExecutionResult, LuaExecutionContext};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SceneSummary {
@@ -104,17 +98,18 @@ impl SceneCatalog {
             )
         })?;
 
-        let execution_results = ExecutionResults::default();
-        let ctx = SceneContext {
-            runtime,
-            execution_results: execution_results.clone(),
-        };
+        let ctx = LuaExecutionContext::new(runtime);
 
-        execute.call::<()>(ctx).map_err(|error| {
+        execute.call::<()>(ctx.clone()).map_err(|error| {
             anyhow::anyhow!("scene '{}' execution failed: {error}", scene.summary.id)
         })?;
 
-        Ok(Some(execution_results.take()))
+        Ok(Some(
+            ctx.into_results()
+                .into_iter()
+                .map(scene_result_from_command_result)
+                .collect(),
+        ))
     }
 }
 
@@ -170,182 +165,18 @@ fn load_scene_file(path: &Path) -> Result<Scene> {
     })
 }
 
-fn evaluate_scene_module(lua: &Lua, source: &str, path: &Path) -> Result<Table> {
-    let value = lua
-        .load(source)
-        .set_name(path.to_string_lossy().as_ref())
-        .eval::<Value>()
-        .map_err(|error| {
-            anyhow::anyhow!("failed to evaluate scene file {}: {error}", path.display())
-        })?;
-
-    match value {
-        Value::Table(table) => Ok(table),
-        _ => bail!("scene file {} must return a table", path.display()),
-    }
-}
-
-#[derive(Clone, Default)]
-struct ExecutionResults(Rc<RefCell<Vec<SceneExecutionResult>>>);
-
-impl ExecutionResults {
-    fn push(&self, result: SceneExecutionResult) {
-        self.0.borrow_mut().push(result);
-    }
-
-    fn take(&self) -> Vec<SceneExecutionResult> {
-        self.0.borrow().clone()
-    }
-}
-
-#[derive(Clone)]
-struct SceneContext {
-    runtime: Arc<Runtime>,
-    execution_results: ExecutionResults,
-}
-
-impl UserData for SceneContext {
-    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method(
-            "command",
-            |_, this, (device_id, command): (String, Table)| {
-                let command = lua_table_to_command(&command)?;
-                command.validate().map_err(mlua::Error::external)?;
-
-                let result = match block_in_place(|| {
-                    Handle::current().block_on(
-                        this.runtime
-                            .command_device(&DeviceId(device_id.clone()), command),
-                    )
-                }) {
-                    Ok(true) => SceneExecutionResult {
-                        target: device_id,
-                        status: "ok",
-                        message: None,
-                    },
-                    Ok(false) => SceneExecutionResult {
-                        target: device_id,
-                        status: "unsupported",
-                        message: Some("device commands are not implemented".to_string()),
-                    },
-                    Err(error) => SceneExecutionResult {
-                        target: device_id,
-                        status: "error",
-                        message: Some(error.to_string()),
-                    },
-                };
-                this.execution_results.push(result);
-
-                Ok(())
-            },
-        );
-
-        methods.add_method("invoke", |lua, this, (target, payload): (String, Value)| {
-            let payload = lua_value_to_attribute(payload)?;
-            let response = block_in_place(|| {
-                Handle::current().block_on(this.runtime.invoke(InvokeRequest {
-                    target: target.clone(),
-                    payload,
-                }))
-            })
-            .map_err(mlua::Error::external)?
-            .ok_or_else(|| {
-                mlua::Error::external(format!("invoke target '{target}' is not supported"))
-            })?;
-
-            attribute_to_lua_value(&lua, response.value)
-        });
-    }
-}
-
-fn lua_table_to_command(table: &Table) -> mlua::Result<DeviceCommand> {
-    Ok(DeviceCommand {
-        capability: table.get("capability")?,
-        action: table.get("action")?,
-        value: match table.get::<Value>("value")? {
-            Value::Nil => None,
-            value => Some(lua_value_to_attribute(value)?),
-        },
+fn evaluate_scene_module(lua: &Lua, source: &str, path: &Path) -> Result<mlua::Table> {
+    evaluate_module(lua, source, path.to_string_lossy().as_ref()).map_err(|error| {
+        anyhow::anyhow!("failed to evaluate scene file {}: {error}", path.display())
     })
 }
 
-fn lua_value_to_attribute(value: Value) -> mlua::Result<AttributeValue> {
-    match value {
-        Value::Nil => Ok(AttributeValue::Null),
-        Value::Boolean(value) => Ok(AttributeValue::Bool(value)),
-        Value::Integer(value) => Ok(AttributeValue::Integer(value)),
-        Value::Number(value) => Ok(AttributeValue::Float(value)),
-        Value::String(value) => Ok(AttributeValue::Text(value.to_str()?.to_string())),
-        Value::Table(table) => {
-            if is_array_table(&table)? {
-                let mut values = Vec::new();
-                for value in table.sequence_values::<Value>() {
-                    values.push(lua_value_to_attribute(value?)?);
-                }
-                return Ok(AttributeValue::Array(values));
-            }
-
-            let mut fields = HashMap::new();
-            for pair in table.pairs::<Value, Value>() {
-                let (key, value) = pair?;
-                let Value::String(key) = key else {
-                    return Err(mlua::Error::external("command object keys must be strings"));
-                };
-                fields.insert(key.to_str()?.to_string(), lua_value_to_attribute(value)?);
-            }
-            Ok(AttributeValue::Object(fields))
-        }
-        _ => Err(mlua::Error::external(
-            "command values must be nil, boolean, number, string, or table",
-        )),
+fn scene_result_from_command_result(result: CommandExecutionResult) -> SceneExecutionResult {
+    SceneExecutionResult {
+        target: result.target,
+        status: result.status,
+        message: result.message,
     }
-}
-
-fn attribute_to_lua_value(lua: &Lua, value: AttributeValue) -> mlua::Result<Value> {
-    match value {
-        AttributeValue::Null => Ok(Value::Nil),
-        AttributeValue::Bool(value) => Ok(Value::Boolean(value)),
-        AttributeValue::Integer(value) => Ok(Value::Integer(value)),
-        AttributeValue::Float(value) => Ok(Value::Number(value)),
-        AttributeValue::Text(value) => Ok(Value::String(lua.create_string(&value)?)),
-        AttributeValue::Array(values) => {
-            let table = lua.create_table()?;
-            for (index, value) in values.into_iter().enumerate() {
-                table.set(index + 1, attribute_to_lua_value(lua, value)?)?;
-            }
-            Ok(Value::Table(table))
-        }
-        AttributeValue::Object(fields) => {
-            let table = lua.create_table()?;
-            for (key, value) in fields {
-                table.set(key, attribute_to_lua_value(lua, value)?)?;
-            }
-            Ok(Value::Table(table))
-        }
-    }
-}
-
-fn is_array_table(table: &Table) -> mlua::Result<bool> {
-    let mut count = 0usize;
-
-    for pair in table.pairs::<Value, Value>() {
-        let (key, _) = pair?;
-        let Value::Integer(index) = key else {
-            return Ok(false);
-        };
-        if index <= 0 {
-            return Ok(false);
-        }
-        count += 1;
-    }
-
-    for expected in 1..=count {
-        if table.raw_get::<Value>(expected as i64)? == Value::Nil {
-            return Ok(false);
-        }
-    }
-
-    Ok(true)
 }
 
 #[cfg(test)]
@@ -357,7 +188,8 @@ mod tests {
     use anyhow::Result;
     use smart_home_core::adapter::Adapter;
     use smart_home_core::bus::EventBus;
-    use smart_home_core::model::{Device, DeviceKind, Metadata};
+    use smart_home_core::command::DeviceCommand;
+    use smart_home_core::model::{AttributeValue, Device, DeviceId, DeviceKind, Metadata};
     use smart_home_core::registry::DeviceRegistry;
     use smart_home_core::runtime::{Runtime, RuntimeConfig};
 

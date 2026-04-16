@@ -1,8 +1,10 @@
 [workspace]
 members = [
     "crates/core",
+    "crates/lua-host",
     "crates/adapters",
     "crates/api",
+    "crates/automations",
     "crates/scenes",
     "crates/adapter-ollama",
     "crates/adapter-elgato-lights",

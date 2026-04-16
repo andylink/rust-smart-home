@@ -1,0 +1,10 @@
+[package]
+name = "smart-home-lua-host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
+smart-home-core = { path = "../core" }
+tokio = { version = "1", features = ["rt-multi-thread"] }

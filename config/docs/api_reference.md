@@ -486,6 +486,53 @@ local result = ctx:invoke("ollama:embeddings", {
 })
 ```
 
+## Automations
+
+Automation assets live in `config/automations/`.
+
+Current trigger types:
+
+- `device_state_change`
+- `interval`
+
+Example:
+
+```lua
+return {
+  id = "rain_check",
+  name = "Rain Check",
+  trigger = {
+    type = "device_state_change",
+    device_id = "weather:outside",
+    attribute = "rain",
+    equals = true,
+  },
+  execute = function(ctx, event)
+    local result = ctx:invoke("ollama:vision", {
+      prompt = "Reply only true or false. Are clothes on the clothesline?",
+      image_base64 = "BASE64_IMAGE_HERE",
+    })
+
+    if result.boolean == true then
+      ctx:command("elgato_lights:light:0", {
+        capability = "power",
+        action = "on",
+      })
+    end
+  end
+}
+```
+
+`device_state_change` fields:
+
+- `device_id` required
+- `attribute` optional
+- `equals` optional
+
+`interval` fields:
+
+- `every_secs` required and must be greater than zero
+
 ## Agent Usage Notes
 
 For MCP-style tools or agents working against the running system:
