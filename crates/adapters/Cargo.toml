@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 adapter-elgato-lights = { path = "../adapter-elgato-lights" }
 adapter-open-meteo = { path = "../adapter-open-meteo" }
+adapter-roku-tv = { path = "../adapter-roku-tv" }

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -6,11 +5,14 @@ use reqwest::Client;
 use serde::Deserialize;
 use smart_home_core::adapter::{Adapter, AdapterFactory, RegisteredAdapterFactory};
 use smart_home_core::bus::EventBus;
-use smart_home_core::capability::{TEMPERATURE_OUTDOOR, WIND_DIRECTION, WIND_SPEED, measurement_value};
+use smart_home_core::capability::{
+    measurement_value, TEMPERATURE_OUTDOOR, WIND_DIRECTION, WIND_SPEED,
+};
 use smart_home_core::config::AdapterConfig;
 use smart_home_core::event::Event;
 use smart_home_core::model::{AttributeValue, Attributes, Device, DeviceId, DeviceKind, Metadata};
 use smart_home_core::registry::DeviceRegistry;
+use std::collections::HashMap;
 use tokio::time::{sleep, Duration};
 
 const ADAPTER_NAME: &str = "open_meteo";
@@ -64,7 +66,8 @@ impl OpenMeteoAdapter {
     ) -> Self {
         Self {
             client: Client::new(),
-            poll_interval: poll_interval.unwrap_or_else(|| Duration::from_secs(config.poll_interval_secs)),
+            poll_interval: poll_interval
+                .unwrap_or_else(|| Duration::from_secs(config.poll_interval_secs)),
             config,
             base_url: base_url.into(),
         }
@@ -96,7 +99,10 @@ impl OpenMeteoAdapter {
             ),
             (
                 WIND_DIRECTION,
-                single_attribute(WIND_DIRECTION, AttributeValue::Integer(weather.wind_direction as i64)),
+                single_attribute(
+                    WIND_DIRECTION,
+                    AttributeValue::Integer(weather.wind_direction as i64),
+                ),
             ),
         ] {
             let previous = registry.get(&DeviceId(format!("{ADAPTER_NAME}:{vendor_id}")));
@@ -112,7 +118,10 @@ impl OpenMeteoAdapter {
     async fn fetch_weather(&self) -> Result<CurrentWeather> {
         let response = self
             .client
-            .get(format!("{}/v1/forecast", self.base_url.trim_end_matches('/')))
+            .get(format!(
+                "{}/v1/forecast",
+                self.base_url.trim_end_matches('/')
+            ))
             .query(&[
                 ("latitude", self.config.latitude.to_string()),
                 ("longitude", self.config.longitude.to_string()),
@@ -151,8 +160,8 @@ impl AdapterFactory for OpenMeteoFactory {
     }
 
     fn build(&self, config: AdapterConfig) -> Result<Option<Box<dyn Adapter>>> {
-        let config: OpenMeteoConfig = serde_json::from_value(config)
-            .context("failed to parse open_meteo adapter config")?;
+        let config: OpenMeteoConfig =
+            serde_json::from_value(config).context("failed to parse open_meteo adapter config")?;
         validate_config(&config)?;
 
         if !config.enabled {
@@ -428,7 +437,10 @@ mod tests {
 
         timeout(Duration::from_secs(2), async {
             loop {
-                if matches!(subscriber.recv().await.expect("system error event"), Event::SystemError { .. }) {
+                if matches!(
+                    subscriber.recv().await.expect("system error event"),
+                    Event::SystemError { .. }
+                ) {
                     break;
                 }
             }
@@ -458,7 +470,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adapter_refreshes_last_seen_without_bumping_updated_at_for_identical_poll() -> Result<()> {
+    async fn adapter_refreshes_last_seen_without_bumping_updated_at_for_identical_poll(
+    ) -> Result<()> {
         let server = MockServer::start(vec![
             MockResponse {
                 status_line: "HTTP/1.1 200 OK",

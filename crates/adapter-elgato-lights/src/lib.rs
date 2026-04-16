@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use reqwest::Client;
@@ -14,7 +14,7 @@ use smart_home_core::config::AdapterConfig;
 use smart_home_core::event::Event;
 use smart_home_core::model::{AttributeValue, Attributes, Device, DeviceId, DeviceKind, Metadata};
 use smart_home_core::registry::DeviceRegistry;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 
 const ADAPTER_NAME: &str = "elgato_lights";
 
@@ -92,7 +92,10 @@ impl ElgatoLightsAdapter {
 
     async fn fetch_lights(&self) -> Result<ElgatoLightsResponse> {
         self.client
-            .get(format!("{}/elgato/lights", self.config.base_url.trim_end_matches('/')))
+            .get(format!(
+                "{}/elgato/lights",
+                self.config.base_url.trim_end_matches('/')
+            ))
             .send()
             .await
             .context("failed to request Elgato light state")?
@@ -105,7 +108,10 @@ impl ElgatoLightsAdapter {
 
     async fn update_lights(&self, request: &ElgatoLightsResponse) -> Result<()> {
         self.client
-            .put(format!("{}/elgato/lights", self.config.base_url.trim_end_matches('/')))
+            .put(format!(
+                "{}/elgato/lights",
+                self.config.base_url.trim_end_matches('/')
+            ))
             .json(request)
             .send()
             .await
@@ -148,7 +154,12 @@ impl ElgatoLightsAdapter {
         registry
             .upsert(build_device(index, updated_light, Some(&current)))
             .await
-            .with_context(|| format!("failed to update registry for '{}': command applied", device_id.0))?;
+            .with_context(|| {
+                format!(
+                    "failed to update registry for '{}': command applied",
+                    device_id.0
+                )
+            })?;
 
         Ok(true)
     }
@@ -264,8 +275,14 @@ fn build_device(index: usize, light: ElgatoLight, previous: Option<&Device>) -> 
             POWER.to_string(),
             AttributeValue::Text(if light.on == 0 { "off" } else { "on" }.to_string()),
         ),
-        (STATE.to_string(), AttributeValue::Text("online".to_string())),
-        (BRIGHTNESS.to_string(), AttributeValue::Integer(light.brightness)),
+        (
+            STATE.to_string(),
+            AttributeValue::Text("online".to_string()),
+        ),
+        (
+            BRIGHTNESS.to_string(),
+            AttributeValue::Integer(light.brightness),
+        ),
         (
             COLOR_TEMPERATURE.to_string(),
             AttributeValue::Object(HashMap::from([
@@ -283,10 +300,7 @@ fn build_device(index: usize, light: ElgatoLight, previous: Option<&Device>) -> 
     let metadata = Metadata {
         source: ADAPTER_NAME.to_string(),
         accuracy: None,
-        vendor_specific: HashMap::from([(
-            "light_index".to_string(),
-            serde_json::json!(index),
-        )]),
+        vendor_specific: HashMap::from([("light_index".to_string(), serde_json::json!(index))]),
     };
     let updated_at = previous
         .filter(|device| {
@@ -339,7 +353,10 @@ fn apply_command(light: &mut ElgatoLight, current: &Device, command: &DeviceComm
             light.brightness = value;
         }
         (COLOR_TEMPERATURE, "set") => {
-            let value = command.value.as_ref().context("color temperature command requires a value")?;
+            let value = command
+                .value
+                .as_ref()
+                .context("color temperature command requires a value")?;
             let (kelvin, unit) = parse_temperature_value(value)?;
             if unit != "kelvin" {
                 bail!("elgato_lights only accepts canonical kelvin input");
@@ -369,49 +386,55 @@ fn validate_elgato_command(command: &DeviceCommand) -> Result<()> {
     Ok(())
 }
 
-fn command_matches_light_state(light: &ElgatoLight, current: &Device, command: &DeviceCommand) -> Result<bool> {
-    Ok(match (command.capability.as_str(), command.action.as_str()) {
-        (POWER, "on") => light.on == 1,
-        (POWER, "off") => light.on == 0,
-        (POWER, "toggle") => {
-            let current_power = current
-                .attributes
-                .get(POWER)
-                .and_then(|value| match value {
-                    AttributeValue::Text(power) => Some(power.as_str()),
-                    _ => None,
-                })
-                .unwrap_or("off");
-            if current_power == "on" {
-                light.on == 0
-            } else {
-                light.on == 1
+fn command_matches_light_state(
+    light: &ElgatoLight,
+    current: &Device,
+    command: &DeviceCommand,
+) -> Result<bool> {
+    Ok(
+        match (command.capability.as_str(), command.action.as_str()) {
+            (POWER, "on") => light.on == 1,
+            (POWER, "off") => light.on == 0,
+            (POWER, "toggle") => {
+                let current_power = current
+                    .attributes
+                    .get(POWER)
+                    .and_then(|value| match value {
+                        AttributeValue::Text(power) => Some(power.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("off");
+                if current_power == "on" {
+                    light.on == 0
+                } else {
+                    light.on == 1
+                }
             }
-        }
-        (BRIGHTNESS, "set") => {
-            let expected = command
-                .value
-                .as_ref()
-                .and_then(|value| match value {
-                    AttributeValue::Integer(value) => Some(*value),
-                    _ => None,
-                })
-                .context("brightness command requires integer value")?;
-            light.brightness == expected
-        }
-        (COLOR_TEMPERATURE, "set") => {
-            let value = command
-                .value
-                .as_ref()
-                .context("color temperature command requires a value")?;
-            let (kelvin, unit) = parse_temperature_value(value)?;
-            if unit != "kelvin" {
-                bail!("elgato_lights only accepts canonical kelvin input");
+            (BRIGHTNESS, "set") => {
+                let expected = command
+                    .value
+                    .as_ref()
+                    .and_then(|value| match value {
+                        AttributeValue::Integer(value) => Some(*value),
+                        _ => None,
+                    })
+                    .context("brightness command requires integer value")?;
+                light.brightness == expected
             }
-            light.temperature == kelvin_to_api_temperature(kelvin)
-        }
-        _ => false,
-    })
+            (COLOR_TEMPERATURE, "set") => {
+                let value = command
+                    .value
+                    .as_ref()
+                    .context("color temperature command requires a value")?;
+                let (kelvin, unit) = parse_temperature_value(value)?;
+                if unit != "kelvin" {
+                    bail!("elgato_lights only accepts canonical kelvin input");
+                }
+                light.temperature == kelvin_to_api_temperature(kelvin)
+            }
+            _ => false,
+        },
+    )
 }
 
 fn parse_temperature_value(value: &AttributeValue) -> Result<(i64, &str)> {
@@ -591,13 +614,22 @@ mod tests {
             .get(&DeviceId("elgato_lights:light:0".to_string()))
             .expect("light device exists");
         assert_eq!(device.kind, DeviceKind::Light);
-        assert_eq!(device.attributes.get(POWER), Some(&AttributeValue::Text("on".to_string())));
-        assert_eq!(device.attributes.get(BRIGHTNESS), Some(&AttributeValue::Integer(20)));
+        assert_eq!(
+            device.attributes.get(POWER),
+            Some(&AttributeValue::Text("on".to_string()))
+        );
+        assert_eq!(
+            device.attributes.get(BRIGHTNESS),
+            Some(&AttributeValue::Integer(20))
+        );
         assert_eq!(
             device.attributes.get(COLOR_TEMPERATURE),
             Some(&AttributeValue::Object(HashMap::from([
                 ("value".to_string(), AttributeValue::Integer(4260)),
-                ("unit".to_string(), AttributeValue::Text("kelvin".to_string())),
+                (
+                    "unit".to_string(),
+                    AttributeValue::Text("kelvin".to_string())
+                ),
             ])))
         );
     }
@@ -626,18 +658,28 @@ mod tests {
         let adapter = ElgatoLightsAdapter::new(adapter_config(server.base_url()));
         let registry = DeviceRegistry::new(EventBus::new(16));
 
-        adapter.poll_once(&registry).await.expect("initial poll succeeds");
+        adapter
+            .poll_once(&registry)
+            .await
+            .expect("initial poll succeeds");
         let command = DeviceCommand {
             capability: COLOR_TEMPERATURE.to_string(),
             action: "set".to_string(),
             value: Some(AttributeValue::Object(HashMap::from([
                 ("value".to_string(), AttributeValue::Integer(7000)),
-                ("unit".to_string(), AttributeValue::Text("kelvin".to_string())),
+                (
+                    "unit".to_string(),
+                    AttributeValue::Text("kelvin".to_string()),
+                ),
             ]))),
         };
 
         assert!(adapter
-            .command(&DeviceId("elgato_lights:light:0".to_string()), command, registry.clone())
+            .command(
+                &DeviceId("elgato_lights:light:0".to_string()),
+                command,
+                registry.clone()
+            )
             .await
             .expect("command succeeds"));
 
@@ -648,13 +690,20 @@ mod tests {
             device.attributes.get(COLOR_TEMPERATURE),
             Some(&AttributeValue::Object(HashMap::from([
                 ("value".to_string(), AttributeValue::Integer(7000)),
-                ("unit".to_string(), AttributeValue::Text("kelvin".to_string())),
+                (
+                    "unit".to_string(),
+                    AttributeValue::Text("kelvin".to_string())
+                ),
             ])))
         );
 
         let requests = server.requests();
-        assert!(requests.iter().any(|request| request.starts_with("PUT /elgato/lights HTTP/1.1")));
-        assert!(requests.iter().any(|request| request.contains("\"temperature\":350")));
+        assert!(requests
+            .iter()
+            .any(|request| request.starts_with("PUT /elgato/lights HTTP/1.1")));
+        assert!(requests
+            .iter()
+            .any(|request| request.contains("\"temperature\":350")));
     }
 
     #[tokio::test]
@@ -667,7 +716,10 @@ mod tests {
         let adapter = ElgatoLightsAdapter::new(adapter_config(server.base_url()));
         let registry = DeviceRegistry::new(EventBus::new(16));
 
-        adapter.poll_once(&registry).await.expect("initial poll succeeds");
+        adapter
+            .poll_once(&registry)
+            .await
+            .expect("initial poll succeeds");
         let error = adapter
             .command(
                 &DeviceId("elgato_lights:light:0".to_string()),
@@ -676,7 +728,10 @@ mod tests {
                     action: "set".to_string(),
                     value: Some(AttributeValue::Object(HashMap::from([
                         ("value".to_string(), AttributeValue::Integer(8000)),
-                        ("unit".to_string(), AttributeValue::Text("kelvin".to_string())),
+                        (
+                            "unit".to_string(),
+                            AttributeValue::Text("kelvin".to_string()),
+                        ),
                     ]))),
                 },
                 registry,

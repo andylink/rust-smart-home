@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::Result;
 
 use crate::bus::EventBus;
-use crate::capability::{CapabilitySchema, capability_definition};
+use crate::capability::{capability_definition, CapabilitySchema};
 use crate::event::Event;
 use crate::model::{AttributeValue, Device, DeviceId, Room, RoomId};
 
@@ -182,7 +182,11 @@ impl DeviceRegistry {
             .collect()
     }
 
-    pub async fn assign_device_to_room(&self, device_id: &DeviceId, room_id: Option<RoomId>) -> Result<bool> {
+    pub async fn assign_device_to_room(
+        &self,
+        device_id: &DeviceId,
+        room_id: Option<RoomId>,
+    ) -> Result<bool> {
         if let Some(room_id) = &room_id {
             let rooms = read_guard(&self.rooms);
             if !rooms.contains_key(room_id) {
@@ -224,15 +228,23 @@ fn validate_room_assignment(registry: &DeviceRegistry, device: &Device) -> Resul
     if rooms.contains_key(room_id) {
         Ok(())
     } else {
-        anyhow::bail!("device '{}' references unknown room '{}'", device.id.0, room_id.0)
+        anyhow::bail!(
+            "device '{}' references unknown room '{}'",
+            device.id.0,
+            room_id.0
+        )
     }
 }
 
 fn validate_attributes(device: &Device) -> Result<()> {
     for (key, value) in &device.attributes {
         if let Some(capability) = capability_definition(key) {
-            validate_capability_attribute_value(capability.schema, value)
-                .map_err(|message| anyhow::anyhow!("invalid value for capability '{key}' on '{}': {message}", device.id.0))?;
+            validate_capability_attribute_value(capability.schema, value).map_err(|message| {
+                anyhow::anyhow!(
+                    "invalid value for capability '{key}' on '{}': {message}",
+                    device.id.0
+                )
+            })?;
         }
     }
 
@@ -290,9 +302,27 @@ fn validate_percentage(value: &AttributeValue) -> std::result::Result<(), &'stat
 
 fn validate_rgb_color(value: &AttributeValue) -> std::result::Result<(), &'static str> {
     let fields = expect_object(value, "expected rgb color object")?;
-    validate_integer_field_in_range(fields, "r", 0, 255, "rgb color requires integer 'r' between 0 and 255")?;
-    validate_integer_field_in_range(fields, "g", 0, 255, "rgb color requires integer 'g' between 0 and 255")?;
-    validate_integer_field_in_range(fields, "b", 0, 255, "rgb color requires integer 'b' between 0 and 255")?;
+    validate_integer_field_in_range(
+        fields,
+        "r",
+        0,
+        255,
+        "rgb color requires integer 'r' between 0 and 255",
+    )?;
+    validate_integer_field_in_range(
+        fields,
+        "g",
+        0,
+        255,
+        "rgb color requires integer 'g' between 0 and 255",
+    )?;
+    validate_integer_field_in_range(
+        fields,
+        "b",
+        0,
+        255,
+        "rgb color requires integer 'b' between 0 and 255",
+    )?;
     Ok(())
 }
 
@@ -312,14 +342,32 @@ fn validate_hex_color(value: &AttributeValue) -> std::result::Result<(), &'stati
 
 fn validate_xy_color(value: &AttributeValue) -> std::result::Result<(), &'static str> {
     let fields = expect_object(value, "expected xy color object")?;
-    validate_number_field_in_range(fields, "x", 0.0, 1.0, "xy color requires number 'x' between 0 and 1")?;
-    validate_number_field_in_range(fields, "y", 0.0, 1.0, "xy color requires number 'y' between 0 and 1")?;
+    validate_number_field_in_range(
+        fields,
+        "x",
+        0.0,
+        1.0,
+        "xy color requires number 'x' between 0 and 1",
+    )?;
+    validate_number_field_in_range(
+        fields,
+        "y",
+        0.0,
+        1.0,
+        "xy color requires number 'y' between 0 and 1",
+    )?;
     Ok(())
 }
 
 fn validate_hs_color(value: &AttributeValue) -> std::result::Result<(), &'static str> {
     let fields = expect_object(value, "expected hs color object")?;
-    validate_integer_field_in_range(fields, "hue", 0, 360, "hs color requires integer 'hue' between 0 and 360")?;
+    validate_integer_field_in_range(
+        fields,
+        "hue",
+        0,
+        360,
+        "hs color requires integer 'hue' between 0 and 360",
+    )?;
     validate_integer_field_in_range(
         fields,
         "saturation",
@@ -352,7 +400,10 @@ fn validate_color_temperature(value: &AttributeValue) -> std::result::Result<(),
     }
 }
 
-fn validate_enum(value: &AttributeValue, options: &'static [&'static str]) -> std::result::Result<(), &'static str> {
+fn validate_enum(
+    value: &AttributeValue,
+    options: &'static [&'static str],
+) -> std::result::Result<(), &'static str> {
     match value {
         AttributeValue::Text(text) if options.contains(&text.as_str()) => Ok(()),
         AttributeValue::Text(_) => Err("expected one of the declared enum values"),
@@ -406,7 +457,10 @@ fn validate_number_field_in_range(
 fn validate_measurement(value: &AttributeValue) -> std::result::Result<(), &'static str> {
     match value {
         AttributeValue::Object(fields) => {
-            if !matches!(fields.get("value"), Some(AttributeValue::Float(_) | AttributeValue::Integer(_))) {
+            if !matches!(
+                fields.get("value"),
+                Some(AttributeValue::Float(_) | AttributeValue::Integer(_))
+            ) {
                 return Err("measurement requires numeric 'value'");
             }
             if !matches!(fields.get("unit"), Some(AttributeValue::Text(_))) {
@@ -422,7 +476,10 @@ fn validate_measurement(value: &AttributeValue) -> std::result::Result<(), &'sta
 fn validate_accumulation(value: &AttributeValue) -> std::result::Result<(), &'static str> {
     match value {
         AttributeValue::Object(fields) => {
-            if !matches!(fields.get("value"), Some(AttributeValue::Float(_) | AttributeValue::Integer(_))) {
+            if !matches!(
+                fields.get("value"),
+                Some(AttributeValue::Float(_) | AttributeValue::Integer(_))
+            ) {
                 return Err("accumulation requires numeric 'value'");
             }
             if !matches!(fields.get("unit"), Some(AttributeValue::Text(_))) {

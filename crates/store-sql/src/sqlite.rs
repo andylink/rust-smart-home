@@ -257,7 +257,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use chrono::Utc;
-    use smart_home_core::capability::{TEMPERATURE_OUTDOOR, measurement_value};
+    use smart_home_core::capability::{measurement_value, TEMPERATURE_OUTDOOR};
     use smart_home_core::model::{AttributeValue, DeviceKind};
 
     use super::*;
@@ -314,7 +314,10 @@ mod tests {
 
         store.save_device(&device).await.expect("save succeeds");
 
-        assert_eq!(store.load_all_devices().await.expect("load succeeds"), vec![device]);
+        assert_eq!(
+            store.load_all_devices().await.expect("load succeeds"),
+            vec![device]
+        );
     }
 
     #[tokio::test]
@@ -330,10 +333,19 @@ mod tests {
         let original = sample_device("test:one", 20.0);
         let updated = sample_device("test:one", 21.5);
 
-        store.save_device(&original).await.expect("initial save succeeds");
-        store.save_device(&updated).await.expect("update save succeeds");
+        store
+            .save_device(&original)
+            .await
+            .expect("initial save succeeds");
+        store
+            .save_device(&updated)
+            .await
+            .expect("update save succeeds");
 
-        assert_eq!(store.load_all_devices().await.expect("load succeeds"), vec![updated]);
+        assert_eq!(
+            store.load_all_devices().await.expect("load succeeds"),
+            vec![updated]
+        );
     }
 
     #[tokio::test]
@@ -354,7 +366,11 @@ mod tests {
             .await
             .expect("delete succeeds");
 
-        assert!(store.load_all_devices().await.expect("load succeeds").is_empty());
+        assert!(store
+            .load_all_devices()
+            .await
+            .expect("load succeeds")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -389,7 +405,10 @@ mod tests {
 
         store.save_room(&room).await.expect("save room succeeds");
 
-        assert_eq!(store.load_all_rooms().await.expect("load rooms succeeds"), vec![room]);
+        assert_eq!(
+            store.load_all_rooms().await.expect("load rooms succeeds"),
+            vec![room]
+        );
     }
 
     #[tokio::test]
@@ -402,11 +421,27 @@ mod tests {
         let mut device = sample_device("test:one", 20.0);
 
         store.save_room(&room).await.expect("save room succeeds");
-        store.save_device(&device).await.expect("save device succeeds");
-        store.delete_room(&room.id).await.expect("delete room succeeds");
+        store
+            .save_device(&device)
+            .await
+            .expect("save device succeeds");
+        store
+            .delete_room(&room.id)
+            .await
+            .expect("delete room succeeds");
 
         device.room_id = None;
-        assert!(store.load_all_rooms().await.expect("load rooms succeeds").is_empty());
-        assert_eq!(store.load_all_devices().await.expect("load devices succeeds"), vec![device]);
+        assert!(store
+            .load_all_rooms()
+            .await
+            .expect("load rooms succeeds")
+            .is_empty());
+        assert_eq!(
+            store
+                .load_all_devices()
+                .await
+                .expect("load devices succeeds"),
+            vec![device]
+        );
     }
 }

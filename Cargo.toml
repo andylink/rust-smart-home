@@ -5,6 +5,7 @@ members = [
     "crates/api",
     "crates/adapter-elgato-lights",
     "crates/adapter-open-meteo",
+    "crates/adapter-roku-tv",
     "crates/store-sql",
 ]
 resolver = "2"

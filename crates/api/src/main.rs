@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use axum::extract::ws::{Message, WebSocket};
 use axum::extract::Path;
 use axum::extract::State;
 use axum::extract::WebSocketUpgrade;
-use axum::extract::ws::{Message, WebSocket};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -12,7 +12,7 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use smart_home_adapters as _;
-use smart_home_core::adapter::{Adapter, registered_adapter_factories};
+use smart_home_core::adapter::{registered_adapter_factories, Adapter};
 use smart_home_core::command::DeviceCommand;
 use smart_home_core::config::{Config, PersistenceBackend};
 use smart_home_core::event::Event;
@@ -94,7 +94,8 @@ async fn main() -> Result<()> {
         .await
         .context("failed to create persistence store")?;
 
-    let (adapters, adapter_summaries) = build_adapters(&config).context("failed to build adapters")?;
+    let (adapters, adapter_summaries) =
+        build_adapters(&config).context("failed to build adapters")?;
 
     let runtime = Arc::new(Runtime::new(adapters, config.runtime));
 
@@ -156,7 +157,10 @@ fn build_adapters(config: &Config) -> Result<BuiltAdapters> {
 
     for factory in registered_adapter_factories() {
         if factories.insert(factory.name(), factory).is_some() {
-            anyhow::bail!("duplicate adapter factory registration for '{}'", factory.name());
+            anyhow::bail!(
+                "duplicate adapter factory registration for '{}'",
+                factory.name()
+            );
         }
     }
 
@@ -201,7 +205,9 @@ async fn create_device_store(config: &Config) -> Result<Option<Arc<dyn DeviceSto
                 .await
                 .with_context(|| format!("failed to initialize SQLite store '{database_url}'"))?,
         ),
-        PersistenceBackend::Postgres => anyhow::bail!("persistence backend 'postgres' is not implemented yet"),
+        PersistenceBackend::Postgres => {
+            anyhow::bail!("persistence backend 'postgres' is not implemented yet")
+        }
     };
 
     Ok(Some(store))
@@ -265,7 +271,10 @@ async fn run_persistence_worker(runtime: Arc<Runtime>, store: Arc<dyn DeviceStor
             }
             Ok(Event::AdapterStarted { .. } | Event::SystemError { .. }) => {}
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::warn!(skipped, "persistence subscriber lagged; reconciling registry state");
+                tracing::warn!(
+                    skipped,
+                    "persistence subscriber lagged; reconciling registry state"
+                );
 
                 if let Err(error) = reconcile_device_store(
                     runtime.registry().list_rooms(),
@@ -311,31 +320,36 @@ async fn reconcile_device_store(
         .collect::<std::collections::HashSet<_>>();
 
     for stale_id in persisted_room_ids.difference(&current_room_ids) {
-        store
-            .delete_room(stale_id)
-            .await
-            .with_context(|| format!("failed to delete stale room '{}' during reconciliation", stale_id.0))?;
+        store.delete_room(stale_id).await.with_context(|| {
+            format!(
+                "failed to delete stale room '{}' during reconciliation",
+                stale_id.0
+            )
+        })?;
     }
 
     for room in rooms {
-        store
-            .save_room(&room)
-            .await
-            .with_context(|| format!("failed to save room '{}' during reconciliation", room.id.0))?;
+        store.save_room(&room).await.with_context(|| {
+            format!("failed to save room '{}' during reconciliation", room.id.0)
+        })?;
     }
 
     for stale_id in persisted_ids.difference(&current_ids) {
-        store
-            .delete_device(stale_id)
-            .await
-            .with_context(|| format!("failed to delete stale device '{}' during reconciliation", stale_id.0))?;
+        store.delete_device(stale_id).await.with_context(|| {
+            format!(
+                "failed to delete stale device '{}' during reconciliation",
+                stale_id.0
+            )
+        })?;
     }
 
     for device in devices {
-        store
-            .save_device(&device)
-            .await
-            .with_context(|| format!("failed to save device '{}' during reconciliation", device.id.0))?;
+        store.save_device(&device).await.with_context(|| {
+            format!(
+                "failed to save device '{}' during reconciliation",
+                device.id.0
+            )
+        })?;
     }
 
     Ok(())
@@ -380,10 +394,16 @@ async fn create_room(
     let name = request.name.trim();
 
     if id.is_empty() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "room id must not be empty"));
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "room id must not be empty",
+        ));
     }
     if name.is_empty() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "room name must not be empty"));
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "room name must not be empty",
+        ));
     }
 
     let room = Room {
@@ -417,7 +437,9 @@ async fn list_room_devices(
     Ok(Json(runtime.registry().list_devices_in_room(&room_id)))
 }
 
-async fn list_devices(State(runtime): State<Arc<Runtime>>) -> Json<Vec<smart_home_core::model::Device>> {
+async fn list_devices(
+    State(runtime): State<Arc<Runtime>>,
+) -> Json<Vec<smart_home_core::model::Device>> {
     Json(runtime.registry().list())
 }
 
@@ -612,16 +634,18 @@ mod tests {
     use std::fs;
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
     use std::time::Duration;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use futures_util::StreamExt;
     use reqwest::StatusCode;
     use serde_json::Value;
+    use smart_home_core::capability::{measurement_value, TEMPERATURE_OUTDOOR};
     use smart_home_core::command::DeviceCommand;
-    use smart_home_core::capability::{TEMPERATURE_OUTDOOR, measurement_value};
     use smart_home_core::config::{Config, PersistenceBackend};
-    use smart_home_core::model::{AttributeValue, Device, DeviceId, DeviceKind, Metadata, Room, RoomId};
+    use smart_home_core::model::{
+        AttributeValue, Device, DeviceId, DeviceKind, Metadata, Room, RoomId,
+    };
     use smart_home_core::runtime::RuntimeConfig;
     use store_sql::SqliteDeviceStore;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -669,7 +693,10 @@ mod tests {
                 command.capability,
                 command.value.expect("test command must include value"),
             );
-            registry.upsert(device).await.expect("registry update succeeds");
+            registry
+                .upsert(device)
+                .await
+                .expect("registry update succeeds");
             Ok(true)
         }
     }
@@ -809,7 +836,10 @@ mod tests {
                 .await
                 .expect("seed room persists");
         }
-        store.save_device(&device).await.expect("seed device persists");
+        store
+            .save_device(&device)
+            .await
+            .expect("seed device persists");
 
         let runtime = Arc::new(Runtime::new(
             Vec::new(),
@@ -817,8 +847,14 @@ mod tests {
                 event_bus_capacity: 16,
             },
         ));
-        let rooms = store.load_all_rooms().await.expect("load hydrated rooms succeeds");
-        let devices = store.load_all_devices().await.expect("load hydrated devices succeeds");
+        let rooms = store
+            .load_all_rooms()
+            .await
+            .expect("load hydrated rooms succeeds");
+        let devices = store
+            .load_all_devices()
+            .await
+            .expect("load hydrated devices succeeds");
         runtime.registry().restore_rooms(rooms);
         runtime
             .registry()
@@ -828,7 +864,9 @@ mod tests {
         runtime
     }
 
-    async fn spawn_test_server(runtime: Arc<Runtime>) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    async fn spawn_test_server(
+        runtime: Arc<Runtime>,
+    ) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
         let app = app(
             runtime,
             vec![AdapterSummary {
@@ -945,7 +983,10 @@ mod tests {
             .await
             .expect("assign room request succeeds");
         assert_eq!(assign.status(), StatusCode::OK);
-        assert_eq!(assign.json::<Value>().await.expect("assigned device json")["room_id"], "outside");
+        assert_eq!(
+            assign.json::<Value>().await.expect("assigned device json")["room_id"],
+            "outside"
+        );
 
         let rooms = reqwest::get(format!("http://{addr}/rooms"))
             .await
@@ -961,7 +1002,10 @@ mod tests {
             .json::<Value>()
             .await
             .expect("room devices json body");
-        assert_eq!(room_devices.as_array().expect("room devices array").len(), 1);
+        assert_eq!(
+            room_devices.as_array().expect("room devices array").len(),
+            1
+        );
         assert_eq!(room_devices[0]["id"], "test:device");
 
         let _ = shutdown.send(());
@@ -990,7 +1034,11 @@ mod tests {
             measurement_value(20.0, "celsius"),
         );
         device_a.room_id = Some(RoomId("outside".to_string()));
-        runtime.registry().upsert(device_a).await.expect("device a exists");
+        runtime
+            .registry()
+            .upsert(device_a)
+            .await
+            .expect("device a exists");
 
         let mut device_b = sample_device(
             "test:device-b",
@@ -998,7 +1046,11 @@ mod tests {
             measurement_value(21.0, "celsius"),
         );
         device_b.room_id = Some(RoomId("outside".to_string()));
-        runtime.registry().upsert(device_b).await.expect("device b exists");
+        runtime
+            .registry()
+            .upsert(device_b)
+            .await
+            .expect("device b exists");
 
         let (addr, shutdown, handle) = spawn_test_server(runtime.clone()).await;
 
@@ -1014,8 +1066,14 @@ mod tests {
             .expect("room command request succeeds");
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = response.json::<Value>().await.expect("room command json body");
-        assert_eq!(body.as_array().expect("room command results array").len(), 2);
+        let body = response
+            .json::<Value>()
+            .await
+            .expect("room command json body");
+        assert_eq!(
+            body.as_array().expect("room command results array").len(),
+            2
+        );
 
         let _ = shutdown.send(());
         handle.await.expect("server task completes");
@@ -1059,7 +1117,10 @@ mod tests {
             .expect("device request succeeds");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert_eq!(response.json::<Value>().await.expect("error JSON body")["error"], "device 'nonexistent' not found");
+        assert_eq!(
+            response.json::<Value>().await.expect("error JSON body")["error"],
+            "device 'nonexistent' not found"
+        );
 
         let _ = shutdown.send(());
         handle.await.expect("server task completes");
@@ -1239,8 +1300,9 @@ mod tests {
         }])
         .await;
 
-        let config = Config::load_from_file("/home/andy/projects/rust_home/smart-home/config/default.toml")
-            .expect("default config loads successfully");
+        let config =
+            Config::load_from_file("/home/andy/projects/rust_home/smart-home/config/default.toml")
+                .expect("default config loads successfully");
         let mut adapter_config = config
             .adapters
             .get("open_meteo")
@@ -1255,7 +1317,8 @@ mod tests {
             "open_meteo".to_string(),
             Value::Object(adapter_config),
         )]));
-        let (mut adapters, _) = build_adapters(&config).expect("factory-based adapter build succeeds");
+        let (mut adapters, _) =
+            build_adapters(&config).expect("factory-based adapter build succeeds");
         let adapter = adapters.pop().expect("open_meteo adapter built");
         let runtime = Arc::new(Runtime::new(vec![adapter], config.runtime));
         let runtime_task = {
@@ -1318,8 +1381,9 @@ mod tests {
                     .await
                     .expect("websocket stream yields a message")
                     .expect("websocket message is valid");
-                let payload: Value = serde_json::from_str(message.to_text().expect("text websocket frame"))
-                    .expect("valid websocket JSON frame");
+                let payload: Value =
+                    serde_json::from_str(message.to_text().expect("text websocket frame"))
+                        .expect("valid websocket JSON frame");
 
                 if payload["type"] == "device.state_changed" && payload["id"] == "test:device" {
                     break payload;
@@ -1392,8 +1456,14 @@ mod tests {
                 event_bus_capacity: 16,
             },
         ));
-        let rooms = store.load_all_rooms().await.expect("restored rooms load succeeds");
-        let restored = store.load_all_devices().await.expect("restored load succeeds");
+        let rooms = store
+            .load_all_rooms()
+            .await
+            .expect("restored rooms load succeeds");
+        let restored = store
+            .load_all_devices()
+            .await
+            .expect("restored load succeeds");
         restarted_runtime.registry().restore_rooms(rooms);
         restarted_runtime
             .registry()
@@ -1424,14 +1494,20 @@ mod tests {
             TEMPERATURE_OUTDOOR,
             measurement_value(25.0, "celsius"),
         );
-        store.save_device(&stale).await.expect("seed stale device succeeds");
+        store
+            .save_device(&stale)
+            .await
+            .expect("seed stale device succeeds");
 
         let store_trait: Arc<dyn DeviceStore> = store.clone();
         reconcile_device_store(Vec::new(), vec![current.clone()], store_trait)
             .await
             .expect("reconciliation succeeds");
 
-        assert_eq!(store.load_all_devices().await.expect("load succeeds"), vec![current]);
+        assert_eq!(
+            store.load_all_devices().await.expect("load succeeds"),
+            vec![current]
+        );
     }
 
     #[test]

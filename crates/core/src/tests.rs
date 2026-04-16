@@ -6,26 +6,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use tokio::sync::Notify;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 
 use crate::adapter::Adapter;
 use crate::bus::EventBus;
 use crate::capability::{
-    AVAILABILITY_VALUES, BRIGHTNESS, COLOR_HEX, COLOR_HS, COLOR_MODE, COLOR_MODE_VALUES,
-    COLOR_RGB, COLOR_TEMPERATURE, COLOR_XY, CapabilitySchema, CLOUD_COVERAGE, EFFECT,
-    ILLUMINANCE, LED_INDICATION, LIGHT_CAPABILITIES, LIGHT_EFFECT_VALUES, POWER, POWER_VALUES,
-    STATE, TEMPERATURE_OUTDOOR, TRANSITION, WEATHER_CAPABILITIES, WIND_DIRECTION, WIND_SPEED,
     accumulation_value, capability_definition, light_capability, measurement_value,
-    weather_capability,
+    weather_capability, CapabilitySchema, AVAILABILITY_VALUES, BRIGHTNESS, CLOUD_COVERAGE,
+    COLOR_HEX, COLOR_HS, COLOR_MODE, COLOR_MODE_VALUES, COLOR_RGB, COLOR_TEMPERATURE, COLOR_XY,
+    EFFECT, ILLUMINANCE, LED_INDICATION, LIGHT_CAPABILITIES, LIGHT_EFFECT_VALUES, POWER,
+    POWER_VALUES, STATE, TEMPERATURE_OUTDOOR, TRANSITION, WEATHER_CAPABILITIES, WIND_DIRECTION,
+    WIND_SPEED,
 };
 use crate::command::DeviceCommand;
+use crate::config::Config;
 use crate::event::Event;
 use crate::model::{AttributeValue, Device, DeviceId, DeviceKind, Metadata, Room, RoomId};
 use crate::registry::DeviceRegistry;
-use crate::config::Config;
 use crate::runtime::{Runtime, RuntimeConfig};
 
 struct MockAdapter;
@@ -131,7 +131,10 @@ fn device_round_trips_through_json() {
         measurement_value(21.5, "celsius"),
     );
     attributes.insert("online".to_string(), AttributeValue::Bool(true));
-    attributes.insert("label".to_string(), AttributeValue::Text("patio".to_string()));
+    attributes.insert(
+        "label".to_string(),
+        AttributeValue::Text("patio".to_string()),
+    );
     attributes.insert(WIND_DIRECTION.to_string(), AttributeValue::Integer(225));
     attributes.insert("extra".to_string(), AttributeValue::Null);
 
@@ -179,9 +182,18 @@ async fn event_bus_delivers_events_to_all_subscribers() {
             message: format!("event-{idx}"),
         };
 
-        assert_eq!(sub_a.recv().await.expect("subscriber a receives event"), expected);
-        assert_eq!(sub_b.recv().await.expect("subscriber b receives event"), expected);
-        assert_eq!(sub_c.recv().await.expect("subscriber c receives event"), expected);
+        assert_eq!(
+            sub_a.recv().await.expect("subscriber a receives event"),
+            expected
+        );
+        assert_eq!(
+            sub_b.recv().await.expect("subscriber b receives event"),
+            expected
+        );
+        assert_eq!(
+            sub_c.recv().await.expect("subscriber c receives event"),
+            expected
+        );
     }
 }
 
@@ -239,10 +251,16 @@ async fn upserting_new_device_publishes_device_added() {
         measurement_value(20.0, "celsius"),
     );
 
-    registry.upsert(device.clone()).await.expect("valid device upsert succeeds");
+    registry
+        .upsert(device.clone())
+        .await
+        .expect("valid device upsert succeeds");
 
     assert_eq!(
-        subscriber.recv().await.expect("device added event received"),
+        subscriber
+            .recv()
+            .await
+            .expect("device added event received"),
         Event::DeviceAdded { device }
     );
 }
@@ -263,13 +281,25 @@ async fn upserting_existing_device_publishes_state_changed() {
         measurement_value(21.5, "celsius"),
     );
 
-    registry.upsert(original).await.expect("valid device upsert succeeds");
-    subscriber.recv().await.expect("device added event received");
+    registry
+        .upsert(original)
+        .await
+        .expect("valid device upsert succeeds");
+    subscriber
+        .recv()
+        .await
+        .expect("device added event received");
 
-    registry.upsert(updated.clone()).await.expect("valid device update succeeds");
+    registry
+        .upsert(updated.clone())
+        .await
+        .expect("valid device update succeeds");
 
     assert_eq!(
-        subscriber.recv().await.expect("device updated event received"),
+        subscriber
+            .recv()
+            .await
+            .expect("device updated event received"),
         Event::DeviceStateChanged {
             id: updated.id.clone(),
             attributes: updated.attributes.clone(),
@@ -288,8 +318,14 @@ async fn upserting_identical_state_only_updates_last_seen_without_state_changed_
         measurement_value(20.0, "celsius"),
     );
 
-    registry.upsert(original.clone()).await.expect("initial device insert succeeds");
-    subscriber.recv().await.expect("device added event received");
+    registry
+        .upsert(original.clone())
+        .await
+        .expect("initial device insert succeeds");
+    subscriber
+        .recv()
+        .await
+        .expect("device added event received");
 
     let mut seen_again = original.clone();
     seen_again.last_seen = seen_again.last_seen + chrono::TimeDelta::seconds(30);
@@ -306,7 +342,10 @@ async fn upserting_identical_state_only_updates_last_seen_without_state_changed_
         }
     );
     assert_eq!(
-        registry.get(&seen_again.id).expect("device still exists").updated_at,
+        registry
+            .get(&seen_again.id)
+            .expect("device still exists")
+            .updated_at,
         original.updated_at
     );
 }
@@ -322,12 +361,21 @@ async fn removing_existing_device_publishes_device_removed() {
         measurement_value(20.0, "celsius"),
     );
 
-    registry.upsert(device.clone()).await.expect("valid device upsert succeeds");
-    subscriber.recv().await.expect("device added event received");
+    registry
+        .upsert(device.clone())
+        .await
+        .expect("valid device upsert succeeds");
+    subscriber
+        .recv()
+        .await
+        .expect("device added event received");
 
     assert!(registry.remove(&device.id).await);
     assert_eq!(
-        subscriber.recv().await.expect("device removed event received"),
+        subscriber
+            .recv()
+            .await
+            .expect("device removed event received"),
         Event::DeviceRemoved {
             id: device.id.clone(),
         }
@@ -342,7 +390,10 @@ async fn removing_missing_device_returns_false_without_event() {
     let missing = DeviceId("test:missing".to_string());
 
     assert!(!registry.remove(&missing).await);
-    assert!(matches!(subscriber.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
+    assert!(matches!(
+        subscriber.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
 }
 
 #[tokio::test]
@@ -359,7 +410,10 @@ async fn concurrent_upserts_produce_expected_registry_size() {
                 TEMPERATURE_OUTDOOR,
                 measurement_value(idx as f64, "celsius"),
             );
-            registry.upsert(device).await.expect("valid concurrent upsert succeeds");
+            registry
+                .upsert(device)
+                .await
+                .expect("valid concurrent upsert succeeds");
         }));
     }
 
@@ -381,10 +435,15 @@ async fn restore_loads_devices_without_publishing_events() {
         measurement_value(23.0, "celsius"),
     )];
 
-    registry.restore(restored.clone()).expect("restore succeeds");
+    registry
+        .restore(restored.clone())
+        .expect("restore succeeds");
 
     assert_eq!(registry.list(), restored);
-    assert!(matches!(subscriber.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
+    assert!(matches!(
+        subscriber.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
 }
 
 #[tokio::test]
@@ -402,14 +461,20 @@ async fn assigning_device_to_room_updates_registry() {
     );
 
     registry.upsert_room(room.clone()).await;
-    registry.upsert(device.clone()).await.expect("device insert succeeds");
+    registry
+        .upsert(device.clone())
+        .await
+        .expect("device insert succeeds");
     registry
         .assign_device_to_room(&device.id, Some(room.id.clone()))
         .await
         .expect("assignment succeeds");
 
     assert_eq!(registry.list_devices_in_room(&room.id).len(), 1);
-    assert_eq!(registry.get(&device.id).expect("device exists").room_id, Some(room.id));
+    assert_eq!(
+        registry.get(&device.id).expect("device exists").room_id,
+        Some(room.id)
+    );
 }
 
 #[tokio::test]
@@ -423,9 +488,14 @@ async fn upserting_device_with_unknown_room_is_rejected() {
     );
     device.room_id = Some(RoomId("missing".to_string()));
 
-    let error = registry.upsert(device).await.expect_err("unknown room should fail");
+    let error = registry
+        .upsert(device)
+        .await
+        .expect_err("unknown room should fail");
 
-    assert!(error.to_string().contains("references unknown room 'missing'"));
+    assert!(error
+        .to_string()
+        .contains("references unknown room 'missing'"));
 }
 
 #[tokio::test]
@@ -438,7 +508,9 @@ async fn restore_rejects_invalid_device_shape() {
         AttributeValue::Text("bad".to_string()),
     );
 
-    let error = registry.restore(vec![invalid]).expect_err("invalid restore should fail");
+    let error = registry
+        .restore(vec![invalid])
+        .expect_err("invalid restore should fail");
 
     assert!(error.to_string().contains("expected measurement object"));
 }
@@ -481,7 +553,11 @@ fn weather_capabilities_are_unique_and_typed() {
     let mut seen = std::collections::HashSet::new();
 
     for capability in WEATHER_CAPABILITIES {
-        assert!(seen.insert(capability.key), "duplicate capability key: {}", capability.key);
+        assert!(
+            seen.insert(capability.key),
+            "duplicate capability key: {}",
+            capability.key
+        );
         assert!(capability.read_only);
     }
 
@@ -504,7 +580,11 @@ fn light_capabilities_are_unique_and_typed() {
     let mut seen = std::collections::HashSet::new();
 
     for capability in LIGHT_CAPABILITIES {
-        assert!(seen.insert(capability.key), "duplicate capability key: {}", capability.key);
+        assert!(
+            seen.insert(capability.key),
+            "duplicate capability key: {}",
+            capability.key
+        );
     }
 
     assert_eq!(
@@ -547,7 +627,10 @@ fn capability_helpers_build_expected_shapes() {
         measurement_value(18.5, "celsius"),
         AttributeValue::Object(HashMap::from([
             ("value".to_string(), AttributeValue::Float(18.5)),
-            ("unit".to_string(), AttributeValue::Text("celsius".to_string())),
+            (
+                "unit".to_string(),
+                AttributeValue::Text("celsius".to_string())
+            ),
         ]))
     );
 
@@ -579,7 +662,10 @@ async fn registry_accepts_valid_light_capabilities() {
                     ("b".to_string(), AttributeValue::Integer(0)),
                 ])),
             ),
-            (COLOR_HEX.to_string(), AttributeValue::Text("#ff8000".to_string())),
+            (
+                COLOR_HEX.to_string(),
+                AttributeValue::Text("#ff8000".to_string()),
+            ),
             (
                 COLOR_XY.to_string(),
                 AttributeValue::Object(HashMap::from([
@@ -597,13 +683,22 @@ async fn registry_accepts_valid_light_capabilities() {
             (
                 COLOR_TEMPERATURE.to_string(),
                 AttributeValue::Object(HashMap::from([
-                ("value".to_string(), AttributeValue::Integer(3000)),
-                ("unit".to_string(), AttributeValue::Text("kelvin".to_string())),
-            ])),
-        ),
+                    ("value".to_string(), AttributeValue::Integer(3000)),
+                    (
+                        "unit".to_string(),
+                        AttributeValue::Text("kelvin".to_string()),
+                    ),
+                ])),
+            ),
             (POWER.to_string(), AttributeValue::Text("on".to_string())),
-            (STATE.to_string(), AttributeValue::Text("online".to_string())),
-            (COLOR_MODE.to_string(), AttributeValue::Text("rgb".to_string())),
+            (
+                STATE.to_string(),
+                AttributeValue::Text("online".to_string()),
+            ),
+            (
+                COLOR_MODE.to_string(),
+                AttributeValue::Text("rgb".to_string()),
+            ),
             (EFFECT.to_string(), AttributeValue::Text("none".to_string())),
             (TRANSITION.to_string(), AttributeValue::Float(1.5)),
             (ILLUMINANCE.to_string(), AttributeValue::Integer(320)),
@@ -618,7 +713,10 @@ async fn registry_accepts_valid_light_capabilities() {
         last_seen: Utc::now(),
     };
 
-    registry.upsert(device.clone()).await.expect("valid light device should succeed");
+    registry
+        .upsert(device.clone())
+        .await
+        .expect("valid light device should succeed");
 
     assert_eq!(registry.get(&device.id), Some(device));
 }
@@ -641,9 +739,14 @@ async fn registry_rejects_invalid_brightness_percentage() {
         last_seen: Utc::now(),
     };
 
-    let error = registry.upsert(invalid).await.expect_err("invalid brightness should fail");
+    let error = registry
+        .upsert(invalid)
+        .await
+        .expect_err("invalid brightness should fail");
 
-    assert!(error.to_string().contains("expected integer percentage between 0 and 100"));
+    assert!(error
+        .to_string()
+        .contains("expected integer percentage between 0 and 100"));
 }
 
 #[tokio::test]
@@ -658,7 +761,10 @@ async fn registry_rejects_invalid_color_temperature_unit_or_range() {
             COLOR_TEMPERATURE.to_string(),
             AttributeValue::Object(HashMap::from([
                 ("value".to_string(), AttributeValue::Integer(1000)),
-                ("unit".to_string(), AttributeValue::Text("kelvin".to_string())),
+                (
+                    "unit".to_string(),
+                    AttributeValue::Text("kelvin".to_string()),
+                ),
             ])),
         )]),
         metadata: Metadata {
@@ -675,7 +781,9 @@ async fn registry_rejects_invalid_color_temperature_unit_or_range() {
         .await
         .expect_err("invalid color temperature should fail");
 
-    assert!(error.to_string().contains("color temperature in kelvin must be between 2200 and 7000"));
+    assert!(error
+        .to_string()
+        .contains("color temperature in kelvin must be between 2200 and 7000"));
 }
 
 #[tokio::test]
@@ -686,7 +794,10 @@ async fn registry_rejects_invalid_hex_color_shape() {
         id: DeviceId("elgato:light:bad-hex".to_string()),
         room_id: None,
         kind: DeviceKind::Light,
-        attributes: HashMap::from([(COLOR_HEX.to_string(), AttributeValue::Text("orange".to_string()))]),
+        attributes: HashMap::from([(
+            COLOR_HEX.to_string(),
+            AttributeValue::Text("orange".to_string()),
+        )]),
         metadata: Metadata {
             source: "test".to_string(),
             accuracy: None,
@@ -696,9 +807,14 @@ async fn registry_rejects_invalid_hex_color_shape() {
         last_seen: Utc::now(),
     };
 
-    let error = registry.upsert(invalid).await.expect_err("invalid hex color should fail");
+    let error = registry
+        .upsert(invalid)
+        .await
+        .expect_err("invalid hex color should fail");
 
-    assert!(error.to_string().contains("expected hex color string like '#ff8800'"));
+    assert!(error
+        .to_string()
+        .contains("expected hex color string like '#ff8800'"));
 }
 
 #[test]
@@ -753,7 +869,10 @@ fn device_command_accepts_kelvin_7000() {
         action: "set".to_string(),
         value: Some(AttributeValue::Object(HashMap::from([
             ("value".to_string(), AttributeValue::Integer(7000)),
-            ("unit".to_string(), AttributeValue::Text("kelvin".to_string())),
+            (
+                "unit".to_string(),
+                AttributeValue::Text("kelvin".to_string()),
+            ),
         ]))),
     }
     .validate()
@@ -770,7 +889,10 @@ async fn registry_rejects_invalid_measurement_shape() {
         AttributeValue::Float(20.0),
     );
 
-    let error = registry.upsert(invalid).await.expect_err("invalid measurement should fail");
+    let error = registry
+        .upsert(invalid)
+        .await
+        .expect_err("invalid measurement should fail");
 
     assert!(error.to_string().contains("expected measurement object"));
 }
@@ -785,7 +907,10 @@ async fn registry_rejects_invalid_integer_shape() {
         measurement_value(20.0, "percent"),
     );
 
-    let error = registry.upsert(invalid).await.expect_err("invalid integer should fail");
+    let error = registry
+        .upsert(invalid)
+        .await
+        .expect_err("invalid integer should fail");
 
     assert!(error.to_string().contains("expected integer"));
 }
@@ -803,7 +928,10 @@ async fn runtime_publishes_system_error_when_adapter_fails() {
     runtime.run_until(sleep(Duration::from_millis(10))).await;
 
     assert_eq!(
-        subscriber.recv().await.expect("system error event received"),
+        subscriber
+            .recv()
+            .await
+            .expect("system error event received"),
         Event::SystemError {
             message: "adapter 'failing' failed: adapter failure".to_string(),
         }
@@ -839,13 +967,17 @@ async fn runtime_shuts_down_cleanly_on_shutdown_signal() {
 
 #[test]
 fn config_loads_default_toml() {
-    let config = Config::load_from_file("/home/andy/projects/rust_home/smart-home/config/default.toml")
-        .expect("default config loads successfully");
+    let config =
+        Config::load_from_file("/home/andy/projects/rust_home/smart-home/config/default.toml")
+            .expect("default config loads successfully");
 
     assert_eq!(config.runtime.event_bus_capacity, 1024);
     assert_eq!(config.logging.level, "info");
     assert!(config.persistence.enabled);
-    assert_eq!(config.persistence.backend, crate::config::PersistenceBackend::Sqlite);
+    assert_eq!(
+        config.persistence.backend,
+        crate::config::PersistenceBackend::Sqlite
+    );
     assert_eq!(
         config.persistence.database_url.as_deref(),
         Some("sqlite://data/smart-home.db")
@@ -866,7 +998,10 @@ fn config_loads_default_toml() {
         .get("elgato_lights")
         .expect("elgato_lights adapter config exists");
     assert!(elgato["enabled"].is_boolean());
-    assert_eq!(elgato["base_url"], serde_json::json!("http://127.0.0.1:9123"));
+    assert_eq!(
+        elgato["base_url"],
+        serde_json::json!("http://127.0.0.1:9123")
+    );
     assert_eq!(elgato["poll_interval_secs"], serde_json::json!(30));
 }
 

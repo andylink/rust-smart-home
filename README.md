@@ -1,13 +1,31 @@
 # Smart Home
 
-Smart Home is a Rust workspace for a small home-automation runtime with:
+Smart Home is a Rust workspace for a local home automation runtime built around:
 
-- an in-memory device registry as the hot read path
-- first-class rooms for logical grouping
-- an HTTP API for device inspection
+- adapter-driven device ingestion and control
+- an in-memory device and room registry
+- an HTTP API for inspection and commands
 - a WebSocket event stream for live updates
-- adapter-driven device updates
-- SQLite-backed current-state persistence for restart recovery
+- SQLite-backed current-state persistence
+- a factory-based adapter model designed to be easy for humans and agentic AI to extend
+
+This project is moving toward a workflow where agents can safely add adapters, automations, scenes, and eventually Lua-based scripting with MCP tooling layered on top.
+
+## Read This First
+
+Start here depending on your goal:
+
+- run the system: `config/default.toml`
+- use the API: `config/docs/api_reference.md`
+- build a new adapter: `config/docs/adapter_authoring_guide.md`
+- operate as an agent in this repo: `config/docs/agent_workflows.md`
+- understand why the factory model exists: `config/docs/adapter_factory_refactor_plan.md`
+
+Adapter-specific docs:
+
+- `crates/adapter-open-meteo/README.md`
+- `crates/adapter-elgato-lights/README.md`
+- `crates/adapter-roku-tv/README.md`
 
 ## Workspace Layout
 
@@ -18,39 +36,86 @@ smart-home/
 │   └── docs/
 ├── crates/
 │   ├── adapters/
-│   ├── api/
 │   ├── adapter-elgato-lights/
-│   ├── core/
 │   ├── adapter-open-meteo/
+│   ├── adapter-roku-tv/
+│   ├── api/
+│   ├── core/
 │   └── store-sql/
 └── README.md
 ```
 
-## Current Persistence Model
+## Core Concepts
 
-- `DeviceRegistry` remains the in-memory runtime state used by the API and WebSocket paths.
-- Rooms and device-to-room assignments are part of the same current-state model.
-- Persistence stores latest known device state, not event history.
-- Startup hydrates the registry from SQLite before adapters begin polling.
-- Live device changes are persisted asynchronously after the registry is updated.
-- If the persistence subscriber lags and misses broadcast events, it reconciles from the registry back into the database.
+### Runtime
 
-This keeps reads fast while allowing the process to recover previously persisted state after restart.
+- `crates/core` defines the runtime contracts, device model, command model, capability catalog, registry, and event bus.
+- `crates/api` starts the runtime and exposes HTTP and WebSocket interfaces.
+- `crates/store-sql` persists the current state for restart recovery.
 
-## Adapter Architecture
+### Adapters
 
-Adapters are now built through a compile-time factory registry.
+Adapters are the integration boundary.
 
-- `crates/core` defines the shared `Adapter` and `AdapterFactory` traits.
-- each adapter crate owns its own config struct, validation, and factory registration.
-- `crates/api` discovers registered factories and builds adapters from the generic `[adapters.<name>]` config map.
-- `crates/adapters` is the binary link crate that pulls adapter crates into the final build so their registrations are available at runtime.
+Each adapter crate owns:
 
-This removes adapter-specific startup logic from `api` and adapter-specific config types from `core`.
+- its config struct
+- config validation
+- external protocol/client behavior
+- canonical state mapping
+- command translation
+- factory registration
+- tests
 
-## Adapter Config Model
+The system uses a compile-time factory registry:
 
-Adapter config is intentionally generic at the top level.
+- `crates/core/src/adapter.rs` defines `Adapter`, `AdapterFactory`, and `RegisteredAdapterFactory`
+- `inventory` is used for distributed factory registration
+- `crates/api` discovers factories dynamically at startup
+- `crates/adapters` exists only to link adapter crates into the final binary
+
+### Devices And Rooms
+
+The runtime maintains:
+
+- devices in an in-memory registry
+- rooms as first-class entities
+- device-to-room assignments independent of adapter refreshes
+
+This means adapter polls should preserve room assignment rather than overwrite it.
+
+### Persistence
+
+Persistence is current-state only.
+
+- latest known rooms are persisted
+- latest known devices are persisted
+- startup hydrates the registry from SQLite before adapters begin polling
+- event history is not stored yet
+
+## Current Adapters
+
+### Open-Meteo
+
+- crate: `crates/adapter-open-meteo`
+- type: poll-only sensor adapter
+- publishes weather sensors
+
+### Elgato Lights
+
+- crate: `crates/adapter-elgato-lights`
+- type: polled and commandable multi-device adapter
+- exposes one logical light device per physical light index
+
+### Roku TV
+
+- crate: `crates/adapter-roku-tv`
+- type: polled and commandable single-device adapter
+- currently exposes power control for one TV using a static IP
+
+## Configuration
+
+The top-level adapter config model is generic.
 
 Example:
 
@@ -62,42 +127,96 @@ longitude = -0.1
 poll_interval_secs = 90
 ```
 
-`core` treats each `[adapters.<name>]` section as untyped JSON-like config data.
-Each adapter crate is responsible for deserializing and validating its own section.
+`core` treats each `[adapters.<name>]` section as generic `serde_json::Value` data.
+Each adapter crate is responsible for parsing and validating its own config.
 
-## Adding A New Adapter
+Default config lives at:
 
-To add a new adapter such as `zigbee2mqtt`:
+- `config/default.toml`
 
-1. create `crates/adapter-zigbee2mqtt`
-2. define that crate's config struct and validation rules
-3. implement `Adapter`
-4. implement `AdapterFactory`
-5. register the factory with `inventory`
-6. add the new crate to the workspace in `Cargo.toml`
-7. add the new crate as a dependency in `crates/adapters/Cargo.toml`
-8. add `[adapters.zigbee2mqtt]` to your TOML config
+Current default config includes:
 
-You should not need to edit:
+- `open_meteo`
+- `elgato_lights`
+- `roku_tv`
 
-- `crates/core/src/config.rs`
-- `crates/api/src/main.rs`
+## Running The API
 
-## Unknown Adapter Handling
+From the workspace root:
 
-Startup fails clearly when:
+```bash
+cargo run -p api -- --config config/default.toml
+```
 
-- config references an adapter name that has no registered factory
-- two linked adapter crates register the same adapter name
+The API binds to `127.0.0.1:3000`.
 
-## Device Commands
+See full endpoint details in:
 
-The API accepts canonical device commands at:
+- `config/docs/api_reference.md`
 
-- `POST /devices/{id}/command`
-- `POST /rooms/{id}/command`
+## Typical API Tasks
 
-Command payloads are normalized across adapters:
+### Get all devices
+
+```bash
+curl http://127.0.0.1:3000/devices
+```
+
+### Get one device
+
+```bash
+curl http://127.0.0.1:3000/devices/roku_tv:tv
+```
+
+### List rooms
+
+```bash
+curl http://127.0.0.1:3000/rooms
+```
+
+### Create a room
+
+```bash
+curl -X POST http://127.0.0.1:3000/rooms \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"outside","name":"Outside"}'
+```
+
+### Assign a device to a room
+
+```bash
+curl -X POST http://127.0.0.1:3000/devices/roku_tv:tv/room \
+  -H 'Content-Type: application/json' \
+  -d '{"room_id":"living_room"}'
+```
+
+### Send a command to one device
+
+```bash
+curl -X POST http://127.0.0.1:3000/devices/roku_tv:tv/command \
+  -H 'Content-Type: application/json' \
+  -d '{"capability":"power","action":"toggle"}'
+```
+
+### Send one command to every device in a room
+
+```bash
+curl -X POST http://127.0.0.1:3000/rooms/living_room/command \
+  -H 'Content-Type: application/json' \
+  -d '{"capability":"power","action":"off"}'
+```
+
+### Subscribe to live events
+
+```bash
+wscat -c ws://127.0.0.1:3000/events
+```
+
+## Command Model
+
+Commands are canonical across adapters.
+
+Example:
 
 ```json
 {
@@ -107,7 +226,7 @@ Command payloads are normalized across adapters:
 }
 ```
 
-Examples:
+Examples already used in the repo:
 
 ```json
 { "capability": "power", "action": "on" }
@@ -125,316 +244,65 @@ Examples:
 }
 ```
 
-Validation happens in `core` before an adapter sees the command.
-Adapters translate canonical commands into vendor-specific payloads.
+Validation happens in `core` before the adapter sees the command.
+Adapters are responsible for translating canonical commands into vendor-specific operations.
 
-## Rooms
+## Event Model
 
-Rooms are first-class runtime objects.
+WebSocket clients connected to `/events` receive normalized runtime events such as:
 
-- Devices carry an optional `room_id`.
-- Rooms are persisted independently from devices.
-- Adapters do not own room assignment, so room changes survive adapter refreshes.
-- Outdoor devices can be assigned to any room the user creates, such as `outside`, `garden`, or `yard`.
+- `device.state_changed`
+- `device.removed`
+- `device.room_changed`
+- `room.added`
+- `room.updated`
+- `room.removed`
+- `adapter.started`
+- `system.error`
 
-Current room endpoints:
+`DeviceSeen` events are internal and intentionally filtered from the public WebSocket stream.
 
-- `GET /rooms`
-- `POST /rooms`
-- `GET /rooms/{id}`
-- `GET /rooms/{id}/devices`
-- `POST /rooms/{id}/command`
-- `POST /devices/{id}/room`
+## Documentation Strategy
 
-Create a room:
+This repository now documents two audiences explicitly:
 
-```bash
-curl -X POST http://127.0.0.1:3000/rooms \
-  -H 'Content-Type: application/json' \
-  -d '{"id":"outside","name":"Outside"}'
-```
+### Human readers
 
-Assign a device to a room:
+Humans should be able to:
 
-```bash
-curl -X POST http://127.0.0.1:3000/devices/elgato_lights:light:0/room \
-  -H 'Content-Type: application/json' \
-  -d '{"room_id":"outside"}'
-```
+- understand the runtime model
+- run the API
+- inspect devices and rooms
+- add integrations safely
 
-List all devices in a room:
+### Agentic AI using MCP tooling
 
-```bash
-curl http://127.0.0.1:3000/rooms/outside/devices
-```
+Agents should be able to:
 
-Send one command to every device in a room:
+- discover the current architecture quickly
+- identify the right files to edit
+- avoid changing core files unnecessarily
+- use the API safely and predictably
+- scaffold adapters and verify them with focused tests
 
-```bash
-curl -X POST http://127.0.0.1:3000/rooms/outside/command \
-  -H 'Content-Type: application/json' \
-  -d '{"capability":"power","action":"off"}'
-```
-
-## Elgato Lights Adapter
-
-`adapter-elgato-lights` polls the Elgato Light HTTP API and exposes one `DeviceKind::Light` per light index.
-
-Canonical state exposed for each Elgato light:
-
-- `power`
-- `state`
-- `brightness`
-- `color_temperature`
-
-`color_temperature` is canonicalized to `kelvin` in the public API.
-The adapter converts between canonical kelvin values and the Elgato API temperature scale internally.
-Room assignment is preserved across adapter refreshes.
-
-## Open-Meteo Adapter
-
-`adapter-open-meteo` publishes weather devices as sensors.
-
-- temperature outdoor
-- wind speed
-- wind direction
-
-These devices start with no room assignment.
-Assign them through the room API if you want them grouped with outdoor lights, cameras, or other devices.
-
-Default config entry:
-
-```toml
-[adapters.elgato_lights]
-enabled = false
-base_url = "http://127.0.0.1:9123"
-poll_interval_secs = 30
-```
-
-Enable it by changing:
-
-```toml
-[adapters.elgato_lights]
-enabled = true
-base_url = "http://127.0.0.1:9123"
-poll_interval_secs = 30
-```
-
-## Elgato Command Examples
-
-Assuming the adapter is enabled and the first light appears as `elgato_lights:light:0`:
-
-Turn the light on:
-
-```bash
-curl -X POST http://127.0.0.1:3000/devices/elgato_lights:light:0/command \
-  -H 'Content-Type: application/json' \
-  -d '{"capability":"power","action":"on"}'
-```
-
-Set brightness to 50%:
-
-```bash
-curl -X POST http://127.0.0.1:3000/devices/elgato_lights:light:0/command \
-  -H 'Content-Type: application/json' \
-  -d '{"capability":"brightness","action":"set","value":50}'
-```
-
-Set color temperature to 7000K:
-
-```bash
-curl -X POST http://127.0.0.1:3000/devices/elgato_lights:light:0/command \
-  -H 'Content-Type: application/json' \
-  -d '{"capability":"color_temperature","action":"set","value":{"value":7000,"unit":"kelvin"}}'
-```
-
-Read the normalized device state:
-
-```bash
-curl http://127.0.0.1:3000/devices/elgato_lights:light:0
-```
-
-The returned state will use canonical values such as:
-
-```json
-{
-  "id": "elgato_lights:light:0",
-  "kind": "light",
-  "attributes": {
-    "power": "on",
-    "state": "online",
-    "brightness": 50,
-    "color_temperature": {
-      "value": 7000,
-      "unit": "kelvin"
-    }
-  }
-}
-```
-
-## Requirements
-
-- Rust stable toolchain
-- Cargo
-
-SQLite is embedded through `sqlx` and does not require a separate database server.
-
-## Running The API
-
-From the workspace root:
-
-```bash
-cargo run -p api -- --config config/default.toml
-```
-
-The API binds to `127.0.0.1:3000`.
-
-Useful endpoints:
-
-- `GET /health`
-- `GET /adapters`
-- `GET /rooms`
-- `POST /rooms`
-- `GET /rooms/{id}`
-- `GET /rooms/{id}/devices`
-- `POST /rooms/{id}/command`
-- `GET /devices`
-- `GET /devices/{id}`
-- `POST /devices/{id}/room`
-- `POST /devices/{id}/command`
-- `GET /events`
-
-## Default Persistence Config
-
-`config/default.toml` enables SQLite persistence by default:
-
-```toml
-[persistence]
-enabled = true
-backend = "sqlite"
-database_url = "sqlite://data/smart-home.db"
-auto_create = true
-```
-
-Behavior:
-
-- `enabled = true` turns on startup hydration and background persistence.
-- `backend = "sqlite"` uses the implemented SQLite store.
-- `database_url` points to the local SQLite file.
-- `auto_create = true` creates the database file plus the `rooms` and `devices` tables if missing.
-
-The default database path is relative to the workspace root when you run the API there.
-
-## SQLite Setup Notes
-
-No manual schema bootstrap is required when `auto_create = true`.
-
-On first startup, the app will create:
-
-- the parent directory for the SQLite file if needed
-- the SQLite database file if missing
-- the `rooms` table used for room state
-- the `devices` table used for current device state and room assignment
-
-If you want to inspect the database manually:
-
-```bash
-sqlite3 data/smart-home.db
-```
-
-Example query:
-
-```sql
-SELECT device_id, room_id, kind, updated_at FROM devices ORDER BY device_id;
-```
-
-## Persistence Semantics
-
-The persistence layer is intentionally current-state only.
-
-- `RoomAdded` and `RoomUpdated` write the room record.
-- `RoomRemoved` deletes the room record.
-- `DeviceRoomChanged` writes the updated device record.
-- `DeviceAdded` writes the full device record.
-- `DeviceStateChanged` reads the full canonical device from the registry, then writes it.
-- `DeviceRemoved` deletes the device record.
-- Telemetry/history storage is not implemented yet.
-
-This means:
-
-- `/devices` and `/events` remain backed by the in-memory runtime state.
-- SQLite is the recovery copy used during startup.
-- a sudden crash may still lose the newest in-memory update if it was not flushed yet.
-
-## Timestamp Semantics
-
-Each device now carries two timestamps:
-
-- `updated_at`: the last meaningful state change
-- `last_seen`: the last successful observation from an adapter
-
-Examples:
-
-- if a light changes from `power = "on"` to `power = "off"`, both `updated_at` and `last_seen` move forward
-- if a polling adapter sees the exact same state again, only `last_seen` moves forward
-
-This allows the system to track freshness without treating every poll as a real state transition.
-
-## Event Semantics
-
-WebSocket clients connected to `/events` only receive meaningful runtime events.
-
-- `device.state_changed` is emitted when device state actually changes
-- `device.room_changed` is emitted when a device is reassigned between rooms
-- `room.added`, `room.updated`, and `room.removed` are emitted for room lifecycle changes
-- repeated identical polls do not emit `device.state_changed`
-- internal `last_seen` refreshes are persisted but filtered out of the WebSocket stream
-
-This keeps polling adapters such as Open-Meteo and Elgato Lights from spamming the event stream when the observed state is unchanged.
-
-## Restart Recovery
-
-Restart flow:
-
-1. load config
-2. create the SQLite device store
-3. create the runtime and registry
-4. load persisted rooms from SQLite
-5. restore rooms into the in-memory registry
-6. load persisted devices from SQLite
-7. restore them into the in-memory registry without publishing live device events
-8. start the persistence worker
-9. start adapters and HTTP/WebSocket serving
-
-This allows previously persisted devices to appear in `/devices` immediately after restart, before a new adapter poll cycle runs.
-
-## Configuration Validation
-
-Persistence config validation currently enforces:
-
-- `persistence.database_url` must be present when persistence is enabled
-- unsupported or unimplemented backends fail clearly
-
-Adapter-specific validation is owned by each adapter crate.
-For example:
-
-- Open-Meteo enforces `poll_interval_secs >= 60`
-- Elgato Lights requires a non-empty `base_url`
-- Elgato Lights accepts canonical `color_temperature` commands in `kelvin` and currently supports `2900..=7000`
-
-`postgres` is reserved for future support and is not implemented yet.
+The docs under `config/docs/` are written with both audiences in mind.
 
 ## Development Commands
 
 ```bash
+cargo fmt --all
 cargo check --workspace
-cargo clippy --workspace -- -D warnings
 cargo test --workspace
 ```
 
-## Future Work
+## Near-Term Direction
 
-- PostgreSQL support behind the same `DeviceStore` trait
-- telemetry/history storage
-- configurable telemetry selection by adapter, device, or capability
-- additional adapter crates such as Zigbee2MQTT using the factory pattern
+This project is intended to grow in these areas:
+
+- adapter creation through agent-friendly workflows
+- automations
+- scenes
+- scripting through Lua
+- MCP-assisted project operations
+
+The current adapter factory model is the foundation for that work.

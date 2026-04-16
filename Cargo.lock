@@ -35,6 +35,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "adapter-roku-tv"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "inventory",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "smart-home-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1847,6 +1863,7 @@ version = "0.1.0"
 dependencies = [
  "adapter-elgato-lights",
  "adapter-open-meteo",
+ "adapter-roku-tv",
 ]
 
 [[package]]

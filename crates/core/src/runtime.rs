@@ -49,12 +49,20 @@ impl Runtime {
         &self.bus
     }
 
-    pub async fn command_device(&self, id: &DeviceId, command: DeviceCommand) -> anyhow::Result<bool> {
+    pub async fn command_device(
+        &self,
+        id: &DeviceId,
+        command: DeviceCommand,
+    ) -> anyhow::Result<bool> {
         let Some((adapter_name, _)) = id.0.split_once(':') else {
             return Ok(false);
         };
 
-        let Some(adapter) = self.adapters.iter().find(|adapter| adapter.name() == adapter_name) else {
+        let Some(adapter) = self
+            .adapters
+            .iter()
+            .find(|adapter| adapter.name() == adapter_name)
+        else {
             return Ok(false);
         };
 
@@ -72,7 +80,9 @@ impl Runtime {
             let registry = self.registry.clone();
             let bus = self.bus.clone();
 
-            tasks.spawn(async move { (adapter.name().to_string(), adapter.run(registry, bus).await) });
+            tasks.spawn(
+                async move { (adapter.name().to_string(), adapter.run(registry, bus).await) },
+            );
         }
 
         tokio::pin!(shutdown);
