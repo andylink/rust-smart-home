@@ -1,9 +1,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mlua::{Lua, Table, UserData, UserDataMethods, Value};
 use smart_home_core::command::DeviceCommand;
 use smart_home_core::invoke::InvokeRequest;
@@ -19,6 +21,11 @@ pub struct CommandExecutionResult {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct LuaRuntimeOptions {
+    pub scripts_root: Option<PathBuf>,
+}
+
 #[derive(Clone)]
 pub struct LuaExecutionContext {
     runtime: Arc<Runtime>,
@@ -27,6 +34,11 @@ pub struct LuaExecutionContext {
 
 #[derive(Clone, Default)]
 struct ExecutionResults(Rc<RefCell<Vec<CommandExecutionResult>>>);
+
+#[derive(Clone)]
+struct ScriptLoader {
+    root: PathBuf,
+}
 
 impl ExecutionResults {
     fn push(&self, result: CommandExecutionResult) {
@@ -105,7 +117,82 @@ impl UserData for LuaExecutionContext {
     }
 }
 
-pub fn evaluate_module(lua: &Lua, source: &str, path_name: &str) -> Result<Table> {
+impl ScriptLoader {
+    fn install(&self, lua: &Lua) -> Result<()> {
+        let package: Table = lua
+            .globals()
+            .get("package")
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let loader = self.clone();
+
+        let searcher = lua
+            .create_function(move |lua, module_name: String| {
+                match loader.load_module(lua, &module_name) {
+                    Ok(value) => {
+                        let loaded = value;
+                        let module_loader = lua.create_function(move |_, ()| Ok(loaded.clone()))?;
+                        Ok(Value::Function(module_loader))
+                    }
+                    Err(error) => Ok(Value::String(lua.create_string(&error.to_string())?)),
+                }
+            })
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+        let searchers: Table = package
+            .get::<Table>("searchers")
+            .or_else(|_| package.get::<Table>("loaders"))
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+        let len = searchers.raw_len();
+        for index in (2..=len).rev() {
+            let value: Value = searchers
+                .raw_get(index)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            searchers
+                .raw_set(index + 1, value)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
+        searchers
+            .raw_set(2, searcher)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+        Ok(())
+    }
+
+    fn load_module(&self, lua: &Lua, module_name: &str) -> mlua::Result<Value> {
+        let module_path =
+            resolve_script_module_path(&self.root, module_name).map_err(mlua::Error::external)?;
+        let source = fs::read_to_string(&module_path).map_err(mlua::Error::external)?;
+        let chunk_name = format!("@{}", module_path.display());
+
+        lua.load(&source)
+            .set_name(&chunk_name)
+            .eval::<Value>()
+            .map_err(|error| {
+                mlua::Error::external(format!(
+                    "failed to load script module '{}': {}",
+                    module_name, error
+                ))
+            })
+    }
+}
+
+pub fn prepare_lua(lua: &Lua, options: &LuaRuntimeOptions) -> Result<()> {
+    if let Some(root) = &options.scripts_root {
+        ScriptLoader { root: root.clone() }.install(lua)?;
+    }
+
+    Ok(())
+}
+
+pub fn evaluate_module(
+    lua: &Lua,
+    source: &str,
+    path_name: &str,
+    options: &LuaRuntimeOptions,
+) -> Result<Table> {
+    prepare_lua(lua, options)?;
+
     let value = lua
         .load(source)
         .set_name(path_name)
@@ -206,4 +293,73 @@ fn is_array_table(table: &Table) -> mlua::Result<bool> {
     }
 
     Ok(true)
+}
+
+fn resolve_script_module_path(root: &Path, module_name: &str) -> Result<PathBuf> {
+    if module_name.trim().is_empty() {
+        anyhow::bail!("script module name must not be empty");
+    }
+
+    let mut path = root.to_path_buf();
+    for part in module_name.split('.') {
+        if part.is_empty() {
+            anyhow::bail!("script module name '{module_name}' is invalid");
+        }
+
+        let component_path = Path::new(part);
+        if component_path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            anyhow::bail!("script module name '{module_name}' is invalid");
+        }
+
+        path.push(part);
+    }
+    path.set_extension("lua");
+
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to access scripts directory {}", root.display()))?;
+    let canonical_path = path
+        .canonicalize()
+        .with_context(|| format!("script module '{}' was not found", module_name))?;
+
+    if !canonical_path.starts_with(&canonical_root) {
+        anyhow::bail!(
+            "script module '{}' is outside the scripts directory",
+            module_name
+        );
+    }
+
+    Ok(canonical_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn temp_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("smart-home-lua-host-{unique}"));
+        fs::create_dir_all(&path).expect("create temp scripts dir");
+        path
+    }
+
+    #[test]
+    fn resolves_namespaced_script_module_paths() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join("vision")).expect("create nested dir");
+        fs::write(root.join("vision/ollama.lua"), "return {} ").expect("write script");
+
+        let resolved = resolve_script_module_path(&root, "vision.ollama").expect("resolve path");
+        assert!(resolved.ends_with("vision/ollama.lua"));
+    }
 }

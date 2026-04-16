@@ -10,7 +10,9 @@ use serde::Serialize;
 use smart_home_core::event::Event;
 use smart_home_core::model::AttributeValue;
 use smart_home_core::runtime::Runtime;
-use smart_home_lua_host::{attribute_to_lua_value, evaluate_module, LuaExecutionContext};
+use smart_home_lua_host::{
+    attribute_to_lua_value, evaluate_module, LuaExecutionContext, LuaRuntimeOptions,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AutomationSummary {
@@ -30,6 +32,7 @@ pub struct Automation {
 #[derive(Debug, Clone, Default)]
 pub struct AutomationCatalog {
     automations: Vec<Automation>,
+    scripts_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -54,7 +57,10 @@ impl AutomationCatalog {
         Self::default()
     }
 
-    pub fn load_from_directory(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn load_from_directory(
+        path: impl AsRef<Path>,
+        scripts_root: Option<PathBuf>,
+    ) -> Result<Self> {
         let path = path.as_ref();
         let entries = fs::read_dir(path)
             .with_context(|| format!("failed to read automations directory {}", path.display()))?;
@@ -74,7 +80,7 @@ impl AutomationCatalog {
                 continue;
             }
 
-            let automation = load_automation_file(&entry.path())?;
+            let automation = load_automation_file(&entry.path(), scripts_root.as_deref())?;
             if ids
                 .insert(automation.summary.id.clone(), automation.path.clone())
                 .is_some()
@@ -85,7 +91,10 @@ impl AutomationCatalog {
         }
 
         automations.sort_by(|a, b| a.summary.id.cmp(&b.summary.id));
-        Ok(Self { automations })
+        Ok(Self {
+            automations,
+            scripts_root,
+        })
     }
 
     pub fn summaries(&self) -> Vec<AutomationSummary> {
@@ -112,16 +121,18 @@ impl AutomationRunner {
         {
             let runtime = runtime.clone();
             let automations = self.catalog.automations.clone();
+            let scripts_root = self.catalog.scripts_root.clone();
             tasks.spawn(async move {
-                run_event_trigger_loop(runtime, automations).await;
+                run_event_trigger_loop(runtime, automations, scripts_root).await;
             });
         }
 
         for automation in self.catalog.automations.iter().cloned() {
             if let Trigger::Interval { every_secs } = automation.trigger {
                 let runtime = runtime.clone();
+                let scripts_root = self.catalog.scripts_root.clone();
                 tasks.spawn(async move {
-                    run_interval_trigger_loop(runtime, automation, every_secs).await;
+                    run_interval_trigger_loop(runtime, automation, every_secs, scripts_root).await;
                 });
             }
         }
@@ -130,7 +141,11 @@ impl AutomationRunner {
     }
 }
 
-async fn run_event_trigger_loop(runtime: Arc<Runtime>, automations: Vec<Automation>) {
+async fn run_event_trigger_loop(
+    runtime: Arc<Runtime>,
+    automations: Vec<Automation>,
+    scripts_root: Option<PathBuf>,
+) {
     let mut receiver = runtime.bus().subscribe();
 
     loop {
@@ -140,9 +155,12 @@ async fn run_event_trigger_loop(runtime: Arc<Runtime>, automations: Vec<Automati
                     if let Some(event_value) =
                         automation_event_from_runtime_event(automation, &event)
                     {
-                        if let Err(error) =
-                            execute_automation(automation, runtime.clone(), event_value)
-                        {
+                        if let Err(error) = execute_automation(
+                            automation,
+                            runtime.clone(),
+                            event_value,
+                            scripts_root.as_deref(),
+                        ) {
                             tracing::error!(automation = %automation.summary.id, error = %error, "automation execution failed");
                         }
                     }
@@ -156,7 +174,12 @@ async fn run_event_trigger_loop(runtime: Arc<Runtime>, automations: Vec<Automati
     }
 }
 
-async fn run_interval_trigger_loop(runtime: Arc<Runtime>, automation: Automation, every_secs: u64) {
+async fn run_interval_trigger_loop(
+    runtime: Arc<Runtime>,
+    automation: Automation,
+    every_secs: u64,
+    scripts_root: Option<PathBuf>,
+) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(every_secs));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -178,7 +201,9 @@ async fn run_interval_trigger_loop(runtime: Arc<Runtime>, automation: Automation
             ),
         ]));
 
-        if let Err(error) = execute_automation(&automation, runtime.clone(), event) {
+        if let Err(error) =
+            execute_automation(&automation, runtime.clone(), event, scripts_root.as_deref())
+        {
             tracing::error!(automation = %automation.summary.id, error = %error, "interval automation execution failed");
         }
     }
@@ -188,6 +213,7 @@ fn execute_automation(
     automation: &Automation,
     runtime: Arc<Runtime>,
     event: AttributeValue,
+    scripts_root: Option<&Path>,
 ) -> Result<()> {
     let source = fs::read_to_string(&automation.path).with_context(|| {
         format!(
@@ -196,7 +222,7 @@ fn execute_automation(
         )
     })?;
     let lua = Lua::new();
-    let module = evaluate_automation_module(&lua, &source, &automation.path)?;
+    let module = evaluate_automation_module(&lua, &source, &automation.path, scripts_root)?;
     let execute = module.get::<Function>("execute").map_err(|error| {
         anyhow::anyhow!(
             "automation '{}' is missing execute function: {error}",
@@ -276,11 +302,11 @@ fn automation_event_from_runtime_event(
     ])))
 }
 
-fn load_automation_file(path: &Path) -> Result<Automation> {
+fn load_automation_file(path: &Path, scripts_root: Option<&Path>) -> Result<Automation> {
     let source = fs::read_to_string(path)
         .with_context(|| format!("failed to read automation file {}", path.display()))?;
     let lua = Lua::new();
-    let module = evaluate_automation_module(&lua, &source, path)?;
+    let module = evaluate_automation_module(&lua, &source, path, scripts_root)?;
 
     let id = module.get::<String>("id").map_err(|error| {
         anyhow::anyhow!(
@@ -337,8 +363,21 @@ fn load_automation_file(path: &Path) -> Result<Automation> {
     })
 }
 
-fn evaluate_automation_module(lua: &Lua, source: &str, path: &Path) -> Result<mlua::Table> {
-    evaluate_module(lua, source, path.to_string_lossy().as_ref()).map_err(|error| {
+fn evaluate_automation_module(
+    lua: &Lua,
+    source: &str,
+    path: &Path,
+    scripts_root: Option<&Path>,
+) -> Result<mlua::Table> {
+    evaluate_module(
+        lua,
+        source,
+        path.to_string_lossy().as_ref(),
+        &LuaRuntimeOptions {
+            scripts_root: scripts_root.map(Path::to_path_buf),
+        },
+    )
+    .map_err(|error| {
         anyhow::anyhow!(
             "failed to evaluate automation file {}: {error}",
             path.display()
@@ -403,7 +442,10 @@ fn parse_trigger(value: mlua::Value, path: &Path) -> Result<Trigger> {
                 )
             })?;
             if every_secs == 0 {
-                bail!("automation file {} interval trigger 'every_secs' must be > 0", path.display());
+                bail!(
+                    "automation file {} interval trigger 'every_secs' must be > 0",
+                    path.display()
+                );
             }
 
             Ok(Trigger::Interval { every_secs })
@@ -433,7 +475,7 @@ mod tests {
     use smart_home_core::adapter::Adapter;
     use smart_home_core::bus::EventBus;
     use smart_home_core::command::DeviceCommand;
-    use smart_home_core::model::{Device, DeviceId, DeviceKind, Metadata};
+    use smart_home_core::model::{AttributeValue, Device, DeviceId, DeviceKind, Metadata};
     use smart_home_core::registry::DeviceRegistry;
     use smart_home_core::runtime::{Runtime, RuntimeConfig};
 
@@ -475,12 +517,12 @@ mod tests {
         }
     }
 
-    fn temp_dir() -> PathBuf {
+    fn temp_dir(prefix: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock after epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("smart-home-automations-{unique}"));
+        let path = std::env::temp_dir().join(format!("{prefix}-{unique}"));
         fs::create_dir_all(&path).expect("create temp automations dir");
         path
     }
@@ -507,7 +549,7 @@ mod tests {
 
     #[test]
     fn loads_device_trigger_automation_catalog() {
-        let dir = temp_dir();
+        let dir = temp_dir("smart-home-automations");
         write_automation(
             &dir,
             "rain.lua",
@@ -525,14 +567,14 @@ mod tests {
             }"#,
         );
 
-        let catalog = AutomationCatalog::load_from_directory(&dir).expect("catalog loads");
+        let catalog = AutomationCatalog::load_from_directory(&dir, None).expect("catalog loads");
         assert_eq!(catalog.summaries().len(), 1);
         assert_eq!(catalog.summaries()[0].trigger_type, "device_state_change");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn event_automation_executes_on_matching_state_change() {
-        let dir = temp_dir();
+        let dir = temp_dir("smart-home-automations");
         write_automation(
             &dir,
             "rain.lua",
@@ -584,7 +626,7 @@ mod tests {
             .await
             .expect("target device upsert succeeds");
 
-        let catalog = AutomationCatalog::load_from_directory(&dir).expect("catalog loads");
+        let catalog = AutomationCatalog::load_from_directory(&dir, None).expect("catalog loads");
         let runner = AutomationRunner::new(catalog);
         let runtime_for_runner = runtime.clone();
         let task = tokio::spawn(async move {
@@ -609,6 +651,111 @@ mod tests {
                 .attributes
                 .get("brightness"),
             Some(&AttributeValue::Integer(42))
+        );
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn automation_can_require_script_module() {
+        let dir = temp_dir("smart-home-automations");
+        let scripts_dir = temp_dir("smart-home-scripts");
+        fs::create_dir_all(scripts_dir.join("lighting")).expect("create script namespace dir");
+        fs::write(
+            scripts_dir.join("lighting/helpers.lua"),
+            r#"local M = {}
+
+            function M.level_from_event(event)
+                if event.value == true then
+                    return 55
+                end
+
+                return 10
+            end
+
+            return M"#,
+        )
+        .expect("write helper script");
+        write_automation(
+            &dir,
+            "rain.lua",
+            r#"local helpers = require("lighting.helpers")
+
+            return {
+                id = "rain_check",
+                name = "Rain Check",
+                trigger = {
+                    type = "device_state_change",
+                    device_id = "test:rain",
+                    attribute = "rain",
+                    equals = true,
+                },
+                execute = function(ctx, event)
+                    ctx:command("test:device", {
+                        capability = "brightness",
+                        action = "set",
+                        value = helpers.level_from_event(event),
+                    })
+                end
+            }"#,
+        );
+
+        let runtime = Arc::new(Runtime::new(
+            vec![Box::new(CommandAdapter)],
+            RuntimeConfig {
+                event_bus_capacity: 32,
+            },
+        ));
+        runtime
+            .registry()
+            .upsert(sample_device("test:rain", false))
+            .await
+            .expect("sensor upsert succeeds");
+        runtime
+            .registry()
+            .upsert(Device {
+                id: DeviceId("test:device".to_string()),
+                room_id: None,
+                kind: DeviceKind::Light,
+                attributes: HashMap::from([("brightness".to_string(), AttributeValue::Integer(0))]),
+                metadata: Metadata {
+                    source: "test".to_string(),
+                    accuracy: None,
+                    vendor_specific: HashMap::new(),
+                },
+                updated_at: Utc::now(),
+                last_seen: Utc::now(),
+            })
+            .await
+            .expect("target device upsert succeeds");
+
+        let catalog =
+            AutomationCatalog::load_from_directory(&dir, Some(scripts_dir)).expect("catalog loads");
+        let runner = AutomationRunner::new(catalog);
+        let runtime_for_runner = runtime.clone();
+        let task = tokio::spawn(async move {
+            runner.run(runtime_for_runner).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+
+        runtime
+            .registry()
+            .upsert(sample_device("test:rain", true))
+            .await
+            .expect("sensor change succeeds");
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        assert_eq!(
+            runtime
+                .registry()
+                .get(&DeviceId("test:device".to_string()))
+                .expect("target device exists")
+                .attributes
+                .get("brightness"),
+            Some(&AttributeValue::Integer(55))
         );
 
         task.abort();

@@ -385,6 +385,15 @@ return {
 }
 ```
 
+Lua helper modules can now live in `config/scripts/` and be loaded from scenes or automations with `require(...)`.
+
+Example:
+
+```lua
+local ollama = require("ollama")
+local has_clothes = ollama.vision_bool(ctx, "Reply only true or false. Are clothes on the line?", snapshot_base64)
+```
+
 ## Event Model
 
 WebSocket clients connected to `/events` receive normalized runtime events such as:

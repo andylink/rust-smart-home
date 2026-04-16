@@ -7,7 +7,9 @@ use anyhow::{bail, Context, Result};
 use mlua::{Function, Lua};
 use serde::Serialize;
 use smart_home_core::runtime::Runtime;
-use smart_home_lua_host::{evaluate_module, CommandExecutionResult, LuaExecutionContext};
+use smart_home_lua_host::{
+    evaluate_module, CommandExecutionResult, LuaExecutionContext, LuaRuntimeOptions,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SceneSummary {
@@ -32,6 +34,7 @@ pub struct Scene {
 #[derive(Debug, Clone, Default)]
 pub struct SceneCatalog {
     scenes: HashMap<String, Scene>,
+    scripts_root: Option<PathBuf>,
 }
 
 impl SceneCatalog {
@@ -39,7 +42,10 @@ impl SceneCatalog {
         Self::default()
     }
 
-    pub fn load_from_directory(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn load_from_directory(
+        path: impl AsRef<Path>,
+        scripts_root: Option<PathBuf>,
+    ) -> Result<Self> {
         let path = path.as_ref();
         let entries = fs::read_dir(path)
             .with_context(|| format!("failed to read scenes directory {}", path.display()))?;
@@ -58,14 +64,17 @@ impl SceneCatalog {
                 continue;
             }
 
-            let scene = load_scene_file(&entry.path())?;
+            let scene = load_scene_file(&entry.path(), scripts_root.as_deref())?;
             let scene_id = scene.summary.id.clone();
             if scenes.insert(scene_id.clone(), scene).is_some() {
                 bail!("duplicate scene id '{scene_id}'");
             }
         }
 
-        Ok(Self { scenes })
+        Ok(Self {
+            scenes,
+            scripts_root,
+        })
     }
 
     pub fn summaries(&self) -> Vec<SceneSummary> {
@@ -90,7 +99,8 @@ impl SceneCatalog {
         let source = fs::read_to_string(&scene.path)
             .with_context(|| format!("failed to read scene file {}", scene.path.display()))?;
         let lua = Lua::new();
-        let module = evaluate_scene_module(&lua, &source, &scene.path)?;
+        let module =
+            evaluate_scene_module(&lua, &source, &scene.path, self.scripts_root.as_deref())?;
         let execute = module.get::<Function>("execute").map_err(|error| {
             anyhow::anyhow!(
                 "scene '{}' is missing execute function: {error}",
@@ -113,11 +123,11 @@ impl SceneCatalog {
     }
 }
 
-fn load_scene_file(path: &Path) -> Result<Scene> {
+fn load_scene_file(path: &Path, scripts_root: Option<&Path>) -> Result<Scene> {
     let source = fs::read_to_string(path)
         .with_context(|| format!("failed to read scene file {}", path.display()))?;
     let lua = Lua::new();
-    let module = evaluate_scene_module(&lua, &source, path)?;
+    let module = evaluate_scene_module(&lua, &source, path, scripts_root)?;
 
     let id = module.get::<String>("id").map_err(|error| {
         anyhow::anyhow!(
@@ -165,10 +175,21 @@ fn load_scene_file(path: &Path) -> Result<Scene> {
     })
 }
 
-fn evaluate_scene_module(lua: &Lua, source: &str, path: &Path) -> Result<mlua::Table> {
-    evaluate_module(lua, source, path.to_string_lossy().as_ref()).map_err(|error| {
-        anyhow::anyhow!("failed to evaluate scene file {}: {error}", path.display())
-    })
+fn evaluate_scene_module(
+    lua: &Lua,
+    source: &str,
+    path: &Path,
+    scripts_root: Option<&Path>,
+) -> Result<mlua::Table> {
+    evaluate_module(
+        lua,
+        source,
+        path.to_string_lossy().as_ref(),
+        &LuaRuntimeOptions {
+            scripts_root: scripts_root.map(Path::to_path_buf),
+        },
+    )
+    .map_err(|error| anyhow::anyhow!("failed to evaluate scene file {}: {error}", path.display()))
 }
 
 fn scene_result_from_command_result(result: CommandExecutionResult) -> SceneExecutionResult {
@@ -231,13 +252,13 @@ mod tests {
         }
     }
 
-    fn temp_dir() -> PathBuf {
+    fn temp_dir(prefix: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock after epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("smart-home-scenes-{unique}"));
-        fs::create_dir_all(&path).expect("create temp scenes dir");
+        let path = std::env::temp_dir().join(format!("{prefix}-{unique}"));
+        fs::create_dir_all(&path).expect("create temp dir");
         path
     }
 
@@ -268,7 +289,7 @@ mod tests {
 
     #[test]
     fn loads_valid_scene_catalog() {
-        let dir = temp_dir();
+        let dir = temp_dir("smart-home-scenes");
         write_scene(
             &dir,
             "video.lua",
@@ -280,14 +301,14 @@ mod tests {
             }"#,
         );
 
-        let catalog = SceneCatalog::load_from_directory(&dir).expect("scene catalog loads");
+        let catalog = SceneCatalog::load_from_directory(&dir, None).expect("scene catalog loads");
         assert_eq!(catalog.summaries().len(), 1);
         assert_eq!(catalog.summaries()[0].id, "video");
     }
 
     #[test]
     fn rejects_scene_without_execute() {
-        let dir = temp_dir();
+        let dir = temp_dir("smart-home-scenes");
         write_scene(
             &dir,
             "broken.lua",
@@ -297,7 +318,7 @@ mod tests {
             }"#,
         );
 
-        let error = SceneCatalog::load_from_directory(&dir)
+        let error = SceneCatalog::load_from_directory(&dir, None)
             .err()
             .expect("missing execute should fail");
         assert!(error
@@ -307,7 +328,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn executes_scene_commands_against_runtime() {
-        let dir = temp_dir();
+        let dir = temp_dir("smart-home-scenes");
         write_scene(
             &dir,
             "set-brightness.lua",
@@ -336,7 +357,7 @@ mod tests {
             .await
             .expect("test device exists");
 
-        let catalog = SceneCatalog::load_from_directory(&dir).expect("scene catalog loads");
+        let catalog = SceneCatalog::load_from_directory(&dir, None).expect("scene catalog loads");
         let results = catalog
             .execute("set_brightness", runtime.clone())
             .expect("scene executes")
@@ -352,6 +373,72 @@ mod tests {
                 .attributes
                 .get("brightness"),
             Some(&AttributeValue::Integer(42))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn executes_scene_using_required_script_module() {
+        let dir = temp_dir("smart-home-scenes");
+        let scripts_dir = temp_dir("smart-home-scripts");
+        write_scene(
+            &dir,
+            "set-brightness.lua",
+            r#"local helpers = require("lighting.helpers")
+
+            return {
+                id = "set_brightness",
+                name = "Set Brightness",
+                execute = function(ctx)
+                    helpers.set_brightness(ctx, "test:device", 33)
+                end
+            }"#,
+        );
+        fs::create_dir_all(scripts_dir.join("lighting")).expect("create scripts namespace dir");
+        fs::write(
+            scripts_dir.join("lighting/helpers.lua"),
+            r#"local M = {}
+
+            function M.set_brightness(ctx, device_id, value)
+                ctx:command(device_id, {
+                    capability = "brightness",
+                    action = "set",
+                    value = value,
+                })
+            end
+
+            return M"#,
+        )
+        .expect("write helper script");
+
+        let runtime = Arc::new(Runtime::new(
+            vec![Box::new(CommandAdapter)],
+            RuntimeConfig {
+                event_bus_capacity: 16,
+            },
+        ));
+        runtime
+            .registry()
+            .upsert(sample_device("test:device"))
+            .await
+            .expect("test device exists");
+
+        let catalog = SceneCatalog::load_from_directory(&dir, Some(scripts_dir))
+            .expect("scene catalog loads");
+        let results = catalog
+            .execute("set_brightness", runtime.clone())
+            .expect("scene executes")
+            .expect("scene exists");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, "ok");
+        assert_eq!(
+            runtime
+                .registry()
+                .get(&DeviceId("test:device".to_string()))
+                .expect("updated device exists")
+                .attributes
+                .get("brightness"),
+            Some(&AttributeValue::Integer(33))
         );
     }
 }

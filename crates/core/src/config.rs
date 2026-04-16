@@ -17,6 +17,8 @@ pub struct Config {
     #[serde(default)]
     pub automations: AutomationsConfig,
     #[serde(default)]
+    pub scripts: ScriptsConfig,
+    #[serde(default)]
     pub telemetry: TelemetryConfig,
     #[serde(default)]
     pub adapters: AdaptersConfig,
@@ -50,6 +52,12 @@ pub struct AutomationsConfig {
     pub directory: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ScriptsConfig {
+    pub enabled: bool,
+    pub directory: String,
+}
+
 impl Default for ScenesConfig {
     fn default() -> Self {
         Self {
@@ -64,6 +72,15 @@ impl Default for AutomationsConfig {
         Self {
             enabled: true,
             directory: "config/automations".to_string(),
+        }
+    }
+}
+
+impl Default for ScriptsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            directory: "config/scripts".to_string(),
         }
     }
 }
@@ -142,6 +159,10 @@ impl Config {
 
         if self.automations.enabled && self.automations.directory.trim().is_empty() {
             bail!("automations.directory is required when automations are enabled");
+        }
+
+        if self.scripts.enabled && self.scripts.directory.trim().is_empty() {
+            bail!("scripts.directory is required when scripts are enabled");
         }
 
         Ok(())

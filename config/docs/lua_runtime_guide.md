@@ -12,9 +12,6 @@ Current Lua asset roots:
 
 - `config/scenes/`
 - `config/automations/`
-
-Reserved for future work:
-
 - `config/scripts/`
 
 ## Current Rust Layout
@@ -84,6 +81,57 @@ local result = ctx:invoke("ollama:chat", {
 
 local reply = result.message.content
 ```
+
+## Scripts
+
+Scripts are reusable Lua helper modules.
+
+Location:
+
+- `config/scripts/*.lua`
+
+Scripts are not top-level executable assets in the current design. They are loaded from scenes and automations with `require(...)`.
+
+Example helper module:
+
+```lua
+-- config/scripts/ollama.lua
+local M = {}
+
+function M.vision_bool(ctx, prompt, image_base64)
+  local result = ctx:invoke("ollama:vision", {
+    prompt = prompt,
+    image_base64 = image_base64,
+  })
+
+  return result.boolean == true
+end
+
+return M
+```
+
+Example usage from an automation or scene:
+
+```lua
+local ollama = require("ollama")
+
+if ollama.vision_bool(ctx, "Reply only true or false. Are clothes on the line?", snapshot_base64) then
+  ctx:command("elgato_lights:light:0", {
+    capability = "power",
+    action = "on",
+  })
+end
+```
+
+Namespaced modules are also supported:
+
+- `require("lighting.helpers")` -> `config/scripts/lighting/helpers.lua`
+
+Current rules:
+
+- module names must stay within `config/scripts/`
+- modules are cached by Lua's `require(...)` within a single Lua execution
+- there is no hot reload across runs
 
 ## Scenes
 
@@ -296,7 +344,6 @@ directory = "config/automations"
 
 Not implemented yet:
 
-- `config/scripts/` module loading
 - hot reload for scenes or automations
 - cron or wall-clock scheduling beyond `interval`
 - room-scoped Lua helpers

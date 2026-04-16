@@ -18,6 +18,10 @@ directory = "config/scenes"
 enabled = true
 directory = "config/automations"
 
+[scripts]
+enabled = true
+directory = "config/scripts"
+
 [telemetry]
 enabled = false
 

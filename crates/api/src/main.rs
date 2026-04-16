@@ -113,25 +113,29 @@ async fn main() -> Result<()> {
         build_adapters(&config).context("failed to build adapters")?;
 
     let runtime = Arc::new(Runtime::new(adapters, config.runtime));
+    let scripts_root = config
+        .scripts
+        .enabled
+        .then(|| std::path::PathBuf::from(&config.scripts.directory));
     let scenes = if config.scenes.enabled {
         Arc::new(
-            SceneCatalog::load_from_directory(&config.scenes.directory).with_context(|| {
-                format!("failed to load scenes from {}", config.scenes.directory)
-            })?,
+            SceneCatalog::load_from_directory(&config.scenes.directory, scripts_root.clone())
+                .with_context(|| {
+                    format!("failed to load scenes from {}", config.scenes.directory)
+                })?,
         )
     } else {
         Arc::new(SceneCatalog::empty())
     };
     let automations = if config.automations.enabled {
         Arc::new(
-            AutomationCatalog::load_from_directory(&config.automations.directory).with_context(
-                || {
+            AutomationCatalog::load_from_directory(&config.automations.directory, scripts_root)
+                .with_context(|| {
                     format!(
                         "failed to load automations from {}",
                         config.automations.directory
                     )
-                },
-            )?,
+                })?,
         )
     } else {
         Arc::new(AutomationCatalog::empty())
