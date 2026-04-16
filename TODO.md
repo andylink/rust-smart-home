@@ -65,19 +65,19 @@ These areas are already present and should not be re-planned as greenfield work:
 ## P1 Automation And Lua Runtime Expansion
 
 - [ ] Extend automation triggers beyond `device_state_change` and `interval`.
-- [ ] Add wall-clock and cron-style scheduling.
+- [x] Add wall-clock and cron-style scheduling.
 - [ ] Add sunrise/sunset and weather/time derived triggers.
 - [ ] Add threshold-crossing, debounce, and duration-based triggers.
-- [ ] Add room-scoped and multi-device condition triggers.
-- [ ] Add triggers for room changes, adapter lifecycle events, and selected system errors where useful.
-- [ ] Add optional persisted automation state for cooldowns, dedupe windows, and resumable schedules.
-- [ ] Add Lua read helpers for current device state, room membership, and simple registry queries.
-- [ ] Add Lua logging helpers so scenes and automations can emit useful structured logs.
+- [x] Add room-scoped and multi-device condition triggers.
+- [x] Add triggers for room changes, adapter lifecycle events, and selected system errors where useful.
+- [x] Add optional persisted automation state for cooldowns, dedupe windows, and resumable schedules.
+- [x] Add Lua read helpers for current device state, room membership, and simple registry queries.
+- [x] Add Lua logging helpers so scenes and automations can emit useful structured logs.
 - [ ] Decide whether Lua needs a safe delay/wait primitive or whether that should stay outside first-class automation logic.
 
 ## P2 Adapter And Device Coverage
 
-- [ ] Extend the Roku adapter beyond power so it can represent a more complete TV/media device.
+- [x] Extend the Roku adapter beyond power so it can represent a more complete TV/media device.
 - [ ] Extend existing adapters to use any newly added canonical capabilities where that improves interoperability.
 - [ ] Add the next practical adapters needed for a reliable home graph, likely starting with common sensor or bridge integrations rather than niche devices.
 - [ ] Define a priority list of target adapters based on real household value and protocol stability.

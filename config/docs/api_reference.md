@@ -441,6 +441,12 @@ Current host API exposed to scenes:
 
 - `ctx:command(device_id, command_table)`
 - `ctx:invoke(target, payload_table)`
+- `ctx:get_device(device_id)`
+- `ctx:list_devices()`
+- `ctx:get_room(room_id)`
+- `ctx:list_rooms()`
+- `ctx:list_room_devices(room_id)`
+- `ctx:log(level, message, fields?)`
 
 Example:
 
@@ -540,6 +546,12 @@ Automation assets live in `config/automations/`.
 Current trigger types:
 
 - `device_state_change`
+- `device_room_change`
+- `room_change`
+- `adapter_lifecycle`
+- `system_error`
+- `wall_clock`
+- `cron`
 - `interval`
 
 Example:
@@ -575,6 +587,41 @@ return {
 - `device_id` required
 - `attribute` optional
 - `equals` optional
+
+`device_room_change` fields:
+
+- `device_id` optional
+- `room_id` optional
+
+At least one of `device_id` or `room_id` is required.
+
+`room_change` fields:
+
+- `room_id` optional
+
+`adapter_lifecycle` fields:
+
+- `adapter` optional
+- `event` required, currently `started`
+
+`system_error` fields:
+
+- `contains` optional substring match against the error message
+
+`wall_clock` fields:
+
+- `hour` required, `0..23`
+- `minute` required, `0..59`
+
+`cron` fields:
+
+- `expression` required, currently interpreted as a UTC seven-field cron expression
+
+Automations can also include an optional top-level `state` table:
+
+- `cooldown_secs` optional
+- `dedupe_window_secs` optional
+- `resumable_schedule` optional
 
 `interval` fields:
 

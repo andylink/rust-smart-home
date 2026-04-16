@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use mlua::{Lua, Table, UserData, UserDataMethods, Value};
 use smart_home_core::command::DeviceCommand;
 use smart_home_core::invoke::InvokeRequest;
-use smart_home_core::model::{AttributeValue, DeviceId};
+use smart_home_core::model::{AttributeValue, Device, DeviceId, DeviceKind, Metadata, Room};
 use smart_home_core::runtime::Runtime;
 use tokio::runtime::Handle;
 use tokio::task::block_in_place;
@@ -114,6 +114,191 @@ impl UserData for LuaExecutionContext {
 
             attribute_to_lua_value(&lua, response.value)
         });
+
+        methods.add_method("get_device", |lua, this, device_id: String| {
+            let Some(device) = this.runtime.registry().get(&DeviceId(device_id)) else {
+                return Ok(Value::Nil);
+            };
+
+            attribute_to_lua_value(&lua, device_to_attribute_value(&device))
+        });
+
+        methods.add_method("list_devices", |lua, this, (): ()| {
+            let devices = this
+                .runtime
+                .registry()
+                .list()
+                .into_iter()
+                .map(|device| device_to_attribute_value(&device))
+                .collect();
+
+            attribute_to_lua_value(&lua, AttributeValue::Array(devices))
+        });
+
+        methods.add_method("get_room", |lua, this, room_id: String| {
+            let Some(room) = this.runtime.registry().get_room(&smart_home_core::model::RoomId(room_id)) else {
+                return Ok(Value::Nil);
+            };
+
+            attribute_to_lua_value(&lua, room_to_attribute_value(&room))
+        });
+
+        methods.add_method("list_rooms", |lua, this, (): ()| {
+            let rooms = this
+                .runtime
+                .registry()
+                .list_rooms()
+                .into_iter()
+                .map(|room| room_to_attribute_value(&room))
+                .collect();
+
+            attribute_to_lua_value(&lua, AttributeValue::Array(rooms))
+        });
+
+        methods.add_method("list_room_devices", |lua, this, room_id: String| {
+            let devices = this
+                .runtime
+                .registry()
+                .list_devices_in_room(&smart_home_core::model::RoomId(room_id))
+                .into_iter()
+                .map(|device| device_to_attribute_value(&device))
+                .collect();
+
+            attribute_to_lua_value(&lua, AttributeValue::Array(devices))
+        });
+
+        methods.add_method(
+            "log",
+            |_, _, (level, message, fields): (String, String, Option<Value>)| {
+                let fields = match fields {
+                    Some(Value::Nil) | None => None,
+                    Some(value) => Some(lua_value_to_attribute(value)?),
+                };
+
+                match level.as_str() {
+                    "trace" => tracing::trace!(message = %message, fields = ?fields, "lua log"),
+                    "debug" => tracing::debug!(message = %message, fields = ?fields, "lua log"),
+                    "info" => tracing::info!(message = %message, fields = ?fields, "lua log"),
+                    "warn" => tracing::warn!(message = %message, fields = ?fields, "lua log"),
+                    "error" => tracing::error!(message = %message, fields = ?fields, "lua log"),
+                    _ => {
+                        return Err(mlua::Error::external(format!(
+                            "unsupported log level '{level}'; expected trace, debug, info, warn, or error"
+                        )))
+                    }
+                }
+
+                Ok(())
+            },
+        );
+    }
+}
+
+fn device_to_attribute_value(device: &Device) -> AttributeValue {
+    AttributeValue::Object(HashMap::from([
+        (
+            "id".to_string(),
+            AttributeValue::Text(device.id.0.clone()),
+        ),
+        (
+            "room_id".to_string(),
+            match &device.room_id {
+                Some(room_id) => AttributeValue::Text(room_id.0.clone()),
+                None => AttributeValue::Null,
+            },
+        ),
+        (
+            "kind".to_string(),
+            AttributeValue::Text(device_kind_name(&device.kind).to_string()),
+        ),
+        (
+            "attributes".to_string(),
+            AttributeValue::Object(device.attributes.clone()),
+        ),
+        (
+            "metadata".to_string(),
+            metadata_to_attribute_value(&device.metadata),
+        ),
+        (
+            "updated_at".to_string(),
+            AttributeValue::Text(device.updated_at.to_rfc3339()),
+        ),
+        (
+            "last_seen".to_string(),
+            AttributeValue::Text(device.last_seen.to_rfc3339()),
+        ),
+    ]))
+}
+
+fn room_to_attribute_value(room: &Room) -> AttributeValue {
+    AttributeValue::Object(HashMap::from([
+        ("id".to_string(), AttributeValue::Text(room.id.0.clone())),
+        ("name".to_string(), AttributeValue::Text(room.name.clone())),
+    ]))
+}
+
+fn metadata_to_attribute_value(metadata: &Metadata) -> AttributeValue {
+    let mut fields = HashMap::from([(
+        "source".to_string(),
+        AttributeValue::Text(metadata.source.clone()),
+    )]);
+
+    fields.insert(
+        "accuracy".to_string(),
+        match metadata.accuracy {
+            Some(value) => AttributeValue::Float(value),
+            None => AttributeValue::Null,
+        },
+    );
+    fields.insert(
+        "vendor_specific".to_string(),
+        AttributeValue::Object(
+            metadata
+                .vendor_specific
+                .iter()
+                .map(|(key, value)| (key.clone(), json_value_to_attribute_value(value)))
+                .collect(),
+        ),
+    );
+
+    AttributeValue::Object(fields)
+}
+
+fn json_value_to_attribute_value(value: &serde_json::Value) -> AttributeValue {
+    match value {
+        serde_json::Value::Null => AttributeValue::Null,
+        serde_json::Value::Bool(value) => AttributeValue::Bool(*value),
+        serde_json::Value::Number(value) => {
+            if let Some(integer) = value.as_i64() {
+                AttributeValue::Integer(integer)
+            } else if let Some(float) = value.as_f64() {
+                AttributeValue::Float(float)
+            } else {
+                AttributeValue::Null
+            }
+        }
+        serde_json::Value::String(value) => AttributeValue::Text(value.clone()),
+        serde_json::Value::Array(values) => AttributeValue::Array(
+            values
+                .iter()
+                .map(json_value_to_attribute_value)
+                .collect(),
+        ),
+        serde_json::Value::Object(fields) => AttributeValue::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), json_value_to_attribute_value(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn device_kind_name(kind: &DeviceKind) -> &'static str {
+    match kind {
+        DeviceKind::Sensor => "sensor",
+        DeviceKind::Light => "light",
+        DeviceKind::Switch => "switch",
+        DeviceKind::Virtual => "virtual",
     }
 }
 
@@ -339,9 +524,12 @@ fn resolve_script_module_path(root: &Path, module_name: &str) -> Result<PathBuf>
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use smart_home_core::model::{AttributeValue, Device, DeviceId, DeviceKind, Metadata, Room, RoomId};
+    use smart_home_core::runtime::{Runtime, RuntimeConfig};
 
     fn temp_dir() -> PathBuf {
         let unique = SystemTime::now()
@@ -361,5 +549,108 @@ mod tests {
 
         let resolved = resolve_script_module_path(&root, "vision.ollama").expect("resolve path");
         assert!(resolved.ends_with("vision/ollama.lua"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn context_can_read_devices_and_rooms_from_registry() {
+        let runtime = Arc::new(Runtime::new(
+            Vec::new(),
+            RuntimeConfig {
+                event_bus_capacity: 16,
+            },
+        ));
+        runtime
+            .registry()
+            .upsert_room(Room {
+                id: RoomId("kitchen".to_string()),
+                name: "Kitchen".to_string(),
+            })
+            .await;
+        runtime
+            .registry()
+            .upsert(Device {
+                id: DeviceId("test:device".to_string()),
+                room_id: Some(RoomId("kitchen".to_string())),
+                kind: DeviceKind::Light,
+                attributes: HashMap::from([(
+                    "brightness".to_string(),
+                    AttributeValue::Integer(25),
+                )]),
+                metadata: Metadata {
+                    source: "test".to_string(),
+                    accuracy: Some(0.9),
+                    vendor_specific: HashMap::from([(
+                        "label".to_string(),
+                        serde_json::json!("Desk Lamp"),
+                    )]),
+                },
+                updated_at: chrono::Utc::now(),
+                last_seen: chrono::Utc::now(),
+            })
+            .await
+            .expect("device upsert succeeds");
+
+        let lua = Lua::new();
+        lua.globals()
+            .set("ctx", LuaExecutionContext::new(runtime.clone()))
+            .expect("ctx is installed");
+
+        let device = lua
+            .load(
+                r#"
+                local device = ctx:get_device("test:device")
+                assert(device.id == "test:device")
+                assert(device.room_id == "kitchen")
+                assert(device.attributes.brightness == 25)
+                assert(device.metadata.vendor_specific.label == "Desk Lamp")
+                return device
+                "#,
+            )
+            .eval::<Table>()
+            .expect("device query succeeds");
+        assert_eq!(device.get::<String>("kind").expect("device kind"), "light");
+
+        let room_devices = lua
+            .load(
+                r#"
+                local rooms = ctx:list_rooms()
+                assert(#rooms == 1)
+                local devices = ctx:list_room_devices("kitchen")
+                assert(#devices == 1)
+                return devices
+                "#,
+            )
+            .eval::<Table>()
+            .expect("room query succeeds");
+        let first_device: Table = room_devices.get(1).expect("first room device");
+        assert_eq!(
+            first_device.get::<String>("id").expect("device id"),
+            "test:device"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn context_log_accepts_structured_fields() {
+        let runtime = Arc::new(Runtime::new(
+            Vec::new(),
+            RuntimeConfig {
+                event_bus_capacity: 16,
+            },
+        ));
+        let lua = Lua::new();
+        lua.globals()
+            .set("ctx", LuaExecutionContext::new(runtime))
+            .expect("ctx is installed");
+
+        lua.load(
+            r#"
+            ctx:log("info", "automation checkpoint", {
+                automation_id = "test",
+                attempts = 2,
+            })
+            "#,
+        )
+        .exec()
+        .expect("structured log call succeeds");
     }
 }

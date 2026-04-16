@@ -1,17 +1,21 @@
 use std::collections::HashMap;
 use std::fs;
+use std::str::FromStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use cron::Schedule;
 use mlua::{Function, HookTriggers, Lua, VmState};
 use serde::Serialize;
 use smart_home_core::event::Event;
-use smart_home_core::model::{AttributeValue, Attributes, Device, DeviceId};
+use smart_home_core::model::{AttributeValue, Attributes, DeviceId};
 use smart_home_core::runtime::Runtime;
-use smart_home_core::store::{AutomationExecutionHistoryEntry, SceneStepResult};
+use smart_home_core::store::{
+    AutomationExecutionHistoryEntry, AutomationRuntimeState, DeviceStore, SceneStepResult,
+};
 use smart_home_lua_host::{
     attribute_to_lua_value, evaluate_module, LuaExecutionContext, LuaRuntimeOptions,
 };
@@ -35,6 +39,7 @@ pub struct Automation {
     pub summary: AutomationSummary,
     path: PathBuf,
     trigger: Trigger,
+    runtime_state_policy: RuntimeStatePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -64,21 +69,54 @@ enum Trigger {
         attribute: Option<String>,
         equals: Option<AttributeValue>,
     },
+    DeviceRoomChange {
+        device_id: Option<String>,
+        room_id: Option<String>,
+    },
+    RoomChange {
+        room_id: Option<String>,
+    },
+    AdapterLifecycle {
+        adapter: Option<String>,
+        event: AdapterLifecycleEvent,
+    },
+    SystemError {
+        contains: Option<String>,
+    },
+    WallClock {
+        hour: u32,
+        minute: u32,
+    },
+    Cron {
+        expression: String,
+        schedule: Schedule,
+    },
     Interval {
         every_secs: u64,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AdapterLifecycleEvent {
+    Started,
 }
 
 #[derive(Clone)]
 pub struct AutomationRunner {
     catalog: AutomationCatalog,
     observer: Option<Arc<dyn AutomationExecutionObserver>>,
+    state_store: Option<Arc<dyn DeviceStore>>,
 }
 
 #[derive(Clone)]
 pub struct AutomationController {
     catalog: AutomationCatalog,
     observer: Option<Arc<dyn AutomationExecutionObserver>>,
+}
+
+#[derive(Clone)]
+pub struct AutomationStateStore {
+    store: Arc<dyn DeviceStore>,
 }
 
 #[derive(Clone)]
@@ -97,6 +135,26 @@ struct AutomationExecutionRecord {
     error: Option<String>,
     results: Vec<SceneStepResult>,
     duration_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct RuntimeStatePolicy {
+    cooldown_secs: Option<u64>,
+    dedupe_window_secs: Option<u64>,
+    resumable_schedule: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LoadedAutomationRuntimeState {
+    last_triggered_at: Option<DateTime<Utc>>,
+    last_trigger_fingerprint: Option<String>,
+    last_scheduled_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+enum TriggerDecision {
+    Execute,
+    Skip,
 }
 
 impl AutomationCatalog {
@@ -233,11 +291,17 @@ impl AutomationRunner {
         Self {
             catalog,
             observer: None,
+            state_store: None,
         }
     }
 
     pub fn with_observer(mut self, observer: Arc<dyn AutomationExecutionObserver>) -> Self {
         self.observer = Some(observer);
+        self
+    }
+
+    pub fn with_state_store(mut self, store: Arc<dyn DeviceStore>) -> Self {
+        self.state_store = Some(store);
         self
     }
 
@@ -262,44 +326,77 @@ impl AutomationRunner {
     async fn run_with_options(self, runtime: Arc<Runtime>, execution: ExecutionControl) {
         let mut tasks = tokio::task::JoinSet::new();
 
-        if self
-            .catalog
-            .automations
-            .iter()
-            .any(|automation| matches!(automation.trigger, Trigger::DeviceStateChange { .. }))
+        if self.catalog.automations.iter().any(trigger_uses_event_bus)
         {
             let runtime = runtime.clone();
             let catalog = self.catalog.clone();
             let scripts_root = self.catalog.scripts_root.clone();
             let execution = execution.clone();
             let observer = self.observer.clone();
+            let state_store = self.state_store.clone();
             tasks.spawn(async move {
-                run_event_trigger_loop(runtime, catalog, scripts_root, execution, observer).await;
+                run_event_trigger_loop(
+                    runtime,
+                    catalog,
+                    scripts_root,
+                    execution,
+                    observer,
+                    state_store,
+                )
+                .await;
             });
         }
 
         for automation in self.catalog.automations.iter().cloned() {
-            if let Trigger::Interval { every_secs } = automation.trigger {
-                if !self.catalog.is_enabled(&automation.summary.id).unwrap_or(true) {
-                    continue;
+            match automation.trigger.clone() {
+                Trigger::Interval { every_secs } => {
+                    if !self.catalog.is_enabled(&automation.summary.id).unwrap_or(true) {
+                        continue;
+                    }
+                    let runtime = runtime.clone();
+                    let scripts_root = self.catalog.scripts_root.clone();
+                    let execution = execution.clone();
+                    let observer = self.observer.clone();
+                    let catalog = self.catalog.clone();
+                    let state_store = self.state_store.clone();
+                    tasks.spawn(async move {
+                        run_interval_trigger_loop(
+                            runtime,
+                            catalog,
+                            automation,
+                            every_secs,
+                            scripts_root,
+                            execution,
+                            observer,
+                            state_store,
+                        )
+                        .await;
+                    });
                 }
-                let runtime = runtime.clone();
-                let scripts_root = self.catalog.scripts_root.clone();
-                let execution = execution.clone();
-                let observer = self.observer.clone();
-                let catalog = self.catalog.clone();
-                tasks.spawn(async move {
-                    run_interval_trigger_loop(
-                        runtime,
-                        catalog,
-                        automation,
-                        every_secs,
-                        scripts_root,
-                        execution,
-                        observer,
-                    )
-                    .await;
-                });
+                Trigger::WallClock { .. } | Trigger::Cron { .. } => {
+                    if !self.catalog.is_enabled(&automation.summary.id).unwrap_or(true) {
+                        continue;
+                    }
+                    let runtime = runtime.clone();
+                    let scripts_root = self.catalog.scripts_root.clone();
+                    let execution = execution.clone();
+                    let observer = self.observer.clone();
+                    let catalog = self.catalog.clone();
+                    let state_store = self.state_store.clone();
+                    tasks.spawn(async move {
+                        run_scheduled_trigger_loop(
+                            runtime,
+                            catalog,
+                            automation,
+                            scripts_root,
+                            execution,
+                            observer,
+                            state_store,
+                        )
+                        .await;
+                    });
+                }
+                _ => {}
             }
         }
 
@@ -356,6 +453,7 @@ async fn run_event_trigger_loop(
     scripts_root: Option<PathBuf>,
     execution: ExecutionControl,
     observer: Option<Arc<dyn AutomationExecutionObserver>>,
+    state_store: Option<Arc<dyn DeviceStore>>,
 ) {
     let mut receiver = runtime.bus().subscribe();
     let mut executions = JoinSet::new();
@@ -370,6 +468,9 @@ async fn run_event_trigger_loop(
                     if let Some(event_value) =
                         automation_event_from_runtime_event(automation, &event)
                     {
+                        let state_store = state_store.as_ref().map(|store| AutomationStateStore {
+                            store: store.clone(),
+                        });
                         spawn_automation_execution(
                             &mut executions,
                             automation.clone(),
@@ -378,6 +479,7 @@ async fn run_event_trigger_loop(
                             scripts_root.clone(),
                             execution.clone(),
                             observer.clone(),
+                            state_store,
                         );
                     }
                 }
@@ -394,6 +496,7 @@ async fn run_event_trigger_loop(
                     execution.clone(),
                     skipped,
                     observer.clone(),
+                    state_store.clone(),
                 );
                 while executions.try_join_next().is_some() {}
             }
@@ -410,6 +513,7 @@ async fn run_interval_trigger_loop(
     scripts_root: Option<PathBuf>,
     execution: ExecutionControl,
     observer: Option<Arc<dyn AutomationExecutionObserver>>,
+    state_store: Option<Arc<dyn DeviceStore>>,
 ) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(every_secs));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -436,86 +540,266 @@ async fn run_interval_trigger_loop(
             ),
         ]));
 
-        let permit = match execution.semaphore.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(error) => {
-                tracing::error!(automation = %automation.summary.id, error = %error, "automation runner semaphore closed");
-                break;
-            }
+        if should_skip_trigger(
+            &automation,
+            &event,
+            state_store.as_ref(),
+            Some(Utc::now()),
+        )
+        .await
+        .is_skip()
+        {
+            continue;
+        }
+
+        execute_scheduled_automation(
+            runtime.clone(),
+            &automation,
+            event,
+            scripts_root.clone(),
+            execution.clone(),
+            observer.clone(),
+            state_store.as_ref().map(|store| AutomationStateStore {
+                store: store.clone(),
+            }),
+            Some(Utc::now()),
+        )
+        .await;
+    }
+}
+
+async fn run_scheduled_trigger_loop(
+    runtime: Arc<Runtime>,
+    catalog: AutomationCatalog,
+    automation: Automation,
+    scripts_root: Option<PathBuf>,
+    execution: ExecutionControl,
+    observer: Option<Arc<dyn AutomationExecutionObserver>>,
+    state_store: Option<Arc<dyn DeviceStore>>,
+) {
+    let next_fire_at = next_scheduled_fire_after(
+        &automation,
+        state_store.as_ref().map(|store| AutomationStateStore { store: store.clone() }),
+        Utc::now(),
+    )
+    .await
+    .unwrap_or_else(|| next_schedule_time(&automation.trigger, Utc::now()));
+    let mut next_fire_at = match next_fire_at {
+        Some(next_fire_at) => next_fire_at,
+        None => {
+            tracing::error!(automation = %automation.summary.id, "scheduled automation has no next fire time");
+            return;
+        }
+    };
+
+    loop {
+        let now = Utc::now();
+        let sleep_duration = next_fire_at
+            .signed_duration_since(now)
+            .to_std()
+            .unwrap_or_default();
+        tokio::time::sleep(sleep_duration).await;
+
+        if !catalog.is_enabled(&automation.summary.id).unwrap_or(true) {
+            next_fire_at = match next_schedule_time(&automation.trigger, Utc::now()) {
+                Some(next_fire_at) => next_fire_at,
+                None => break,
+            };
+            continue;
+        }
+
+        let scheduled_for = next_fire_at;
+        next_fire_at = match next_schedule_time(&automation.trigger, scheduled_for) {
+            Some(next_fire_at) => next_fire_at,
+            None => break,
         };
 
-        let automation_clone = automation.clone();
-        let runtime_clone = runtime.clone();
-        let scripts_root_clone = scripts_root.clone();
-        let timeout_duration = execution.timeout;
-        let event_for_observer = event.clone();
-        let join_handle = tokio::spawn(async move {
-            let _permit = permit;
-            execute_automation(
-                &automation_clone,
-                runtime_clone,
-                event,
-                scripts_root_clone.as_deref(),
-                timeout_duration,
-            )
-        });
+        let event = scheduled_trigger_event(&automation.trigger, scheduled_for);
+        execute_scheduled_automation(
+            runtime.clone(),
+            &automation,
+            event,
+            scripts_root.clone(),
+            execution.clone(),
+            observer.clone(),
+            state_store.as_ref().map(|store| AutomationStateStore {
+                store: store.clone(),
+            }),
+            Some(scheduled_for),
+        )
+        .await;
+    }
+}
 
-        tokio::pin!(join_handle);
+async fn execute_scheduled_automation(
+    runtime: Arc<Runtime>,
+    automation: &Automation,
+    event: AttributeValue,
+    scripts_root: Option<PathBuf>,
+    execution: ExecutionControl,
+    observer: Option<Arc<dyn AutomationExecutionObserver>>,
+    state_store: Option<AutomationStateStore>,
+    scheduled_for: Option<DateTime<Utc>>,
+) {
+    if should_skip_trigger(automation, &event, state_store.as_ref().map(|store| &store.store), scheduled_for)
+        .await
+        .is_skip()
+    {
+        return;
+    }
 
-        match timeout(timeout_duration, &mut join_handle).await {
-            Ok(Ok(Ok(record))) => {
-                notify_observer(
-                    observer.as_ref(),
-                    &automation,
-                    event_for_observer,
-                    record,
-                );
-            }
-            Ok(Ok(Err(error))) => {
-                tracing::error!(automation = %automation.summary.id, error = %error, "interval automation execution failed");
-                notify_observer(
-                    observer.as_ref(),
-                    &automation,
-                    event_for_observer,
-                    AutomationExecutionRecord {
-                        status: "error".to_string(),
-                        error: Some(error.to_string()),
-                        results: Vec::new(),
-                        duration_ms: timeout_duration.as_millis() as i64,
-                    },
-                );
-            }
-            Ok(Err(error)) => {
-                tracing::error!(automation = %automation.summary.id, error = %error, "interval automation task failed");
-                notify_observer(
-                    observer.as_ref(),
-                    &automation,
-                    event_for_observer,
-                    AutomationExecutionRecord {
-                        status: "error".to_string(),
-                        error: Some(error.to_string()),
-                        results: Vec::new(),
-                        duration_ms: timeout_duration.as_millis() as i64,
-                    },
-                );
-            }
-            Err(_) => {
-                join_handle.abort();
-                tracing::error!(automation = %automation.summary.id, timeout_secs = timeout_duration.as_secs(), "interval automation execution timed out");
-                notify_observer(
-                    observer.as_ref(),
-                    &automation,
-                    event_for_observer,
-                    AutomationExecutionRecord {
-                        status: "timeout".to_string(),
-                        error: Some("automation execution timed out".to_string()),
-                        results: Vec::new(),
-                        duration_ms: timeout_duration.as_millis() as i64,
-                    },
-                );
-            }
+    let permit = match execution.semaphore.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => {
+            tracing::error!(automation = %automation.summary.id, error = %error, "automation runner semaphore closed");
+            return;
+        }
+    };
+
+    let automation_clone = automation.clone();
+    let runtime_clone = runtime.clone();
+    let scripts_root_clone = scripts_root.clone();
+    let timeout_duration = execution.timeout;
+    let event_for_observer = event.clone();
+    let event_for_task = event.clone();
+    let join_handle = tokio::spawn(async move {
+        let _permit = permit;
+        execute_automation(
+            &automation_clone,
+            runtime_clone,
+            event_for_task,
+            scripts_root_clone.as_deref(),
+            timeout_duration,
+        )
+    });
+
+    tokio::pin!(join_handle);
+
+    match timeout(timeout_duration, &mut join_handle).await {
+        Ok(Ok(Ok(record))) => {
+            persist_runtime_state(automation, &event, state_store.as_ref(), scheduled_for).await;
+            notify_observer(observer.as_ref(), automation, event_for_observer, record);
+        }
+        Ok(Ok(Err(error))) => {
+            tracing::error!(automation = %automation.summary.id, error = %error, "scheduled automation execution failed");
+            notify_observer(
+                observer.as_ref(),
+                automation,
+                event_for_observer,
+                AutomationExecutionRecord {
+                    status: "error".to_string(),
+                    error: Some(error.to_string()),
+                    results: Vec::new(),
+                    duration_ms: timeout_duration.as_millis() as i64,
+                },
+            );
+        }
+        Ok(Err(error)) => {
+            tracing::error!(automation = %automation.summary.id, error = %error, "scheduled automation task failed");
+            notify_observer(
+                observer.as_ref(),
+                automation,
+                event_for_observer,
+                AutomationExecutionRecord {
+                    status: "error".to_string(),
+                    error: Some(error.to_string()),
+                    results: Vec::new(),
+                    duration_ms: timeout_duration.as_millis() as i64,
+                },
+            );
+        }
+        Err(_) => {
+            join_handle.abort();
+            tracing::error!(automation = %automation.summary.id, timeout_secs = timeout_duration.as_secs(), "scheduled automation execution timed out");
+            notify_observer(
+                observer.as_ref(),
+                automation,
+                event_for_observer,
+                AutomationExecutionRecord {
+                    status: "timeout".to_string(),
+                    error: Some("automation execution timed out".to_string()),
+                    results: Vec::new(),
+                    duration_ms: timeout_duration.as_millis() as i64,
+                },
+            );
         }
     }
+}
+
+fn scheduled_trigger_event(trigger: &Trigger, scheduled_at: DateTime<Utc>) -> AttributeValue {
+    match trigger {
+        Trigger::WallClock { hour, minute } => AttributeValue::Object(HashMap::from([
+            (
+                "type".to_string(),
+                AttributeValue::Text("wall_clock".to_string()),
+            ),
+            (
+                "scheduled_at".to_string(),
+                AttributeValue::Text(scheduled_at.to_rfc3339()),
+            ),
+            (
+                "hour".to_string(),
+                AttributeValue::Integer(*hour as i64),
+            ),
+            (
+                "minute".to_string(),
+                AttributeValue::Integer(*minute as i64),
+            ),
+            (
+                "timezone".to_string(),
+                AttributeValue::Text("UTC".to_string()),
+            ),
+        ])),
+        Trigger::Cron { expression, .. } => AttributeValue::Object(HashMap::from([
+            (
+                "type".to_string(),
+                AttributeValue::Text("cron".to_string()),
+            ),
+            (
+                "scheduled_at".to_string(),
+                AttributeValue::Text(scheduled_at.to_rfc3339()),
+            ),
+            (
+                "expression".to_string(),
+                AttributeValue::Text(expression.clone()),
+            ),
+            (
+                "timezone".to_string(),
+                AttributeValue::Text("UTC".to_string()),
+            ),
+        ])),
+        _ => AttributeValue::Object(HashMap::from([(
+            "scheduled_at".to_string(),
+            AttributeValue::Text(scheduled_at.to_rfc3339()),
+        )])),
+    }
+}
+
+fn next_schedule_time(trigger: &Trigger, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    match trigger {
+        Trigger::WallClock { hour, minute } => next_wall_clock_occurrence(*hour, *minute, after),
+        Trigger::Cron { schedule, .. } => schedule.after(&after).next(),
+        _ => None,
+    }
+}
+
+fn next_wall_clock_occurrence(
+    hour: u32,
+    minute: u32,
+    after: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let scheduled_today = after
+        .date_naive()
+        .and_hms_opt(hour, minute, 0)?;
+    let scheduled_today = DateTime::<Utc>::from_naive_utc_and_offset(scheduled_today, Utc);
+
+    if scheduled_today > after {
+        return Some(scheduled_today);
+    }
+
+    let next_day = after.date_naive().checked_add_signed(ChronoDuration::days(1))?;
+    let scheduled_next = next_day.and_hms_opt(hour, minute, 0)?;
+    Some(DateTime::<Utc>::from_naive_utc_and_offset(scheduled_next, Utc))
 }
 
 fn spawn_automation_execution(
@@ -526,6 +810,7 @@ fn spawn_automation_execution(
     scripts_root: Option<PathBuf>,
     execution: ExecutionControl,
     observer: Option<Arc<dyn AutomationExecutionObserver>>,
+    state_store: Option<AutomationStateStore>,
 ) {
     let Ok(permit) = execution.semaphore.clone().try_acquire_owned() else {
         tracing::warn!(automation = %automation.summary.id, "skipping automation execution because the runner is saturated");
@@ -544,9 +829,22 @@ fn spawn_automation_execution(
     };
 
     executions.spawn(async move {
+        if should_skip_trigger(
+            &automation,
+            &event,
+            state_store.as_ref().map(|store| &store.store),
+            event_scheduled_at(&event),
+        )
+        .await
+        .is_skip()
+        {
+            return;
+        }
+
         let timeout_duration = execution.timeout;
         let automation_for_task = automation.clone();
         let event_for_observer = event.clone();
+        let state_store_for_task = state_store.clone();
         let join_handle = tokio::spawn(async move {
             let _permit = permit;
             execute_automation(
@@ -562,6 +860,13 @@ fn spawn_automation_execution(
 
         match timeout(timeout_duration, &mut join_handle).await {
             Ok(Ok(Ok(record))) => {
+                persist_runtime_state(
+                    &automation,
+                    &event_for_observer,
+                    state_store_for_task.as_ref(),
+                    event_scheduled_at(&event_for_observer),
+                )
+                .await;
                 notify_observer(
                     observer.as_ref(),
                     &automation,
@@ -616,6 +921,174 @@ fn spawn_automation_execution(
     });
 }
 
+impl AutomationStateStore {
+    async fn load(&self, automation_id: &str) -> Option<LoadedAutomationRuntimeState> {
+        match self.store.load_automation_runtime_state(automation_id).await {
+            Ok(state) => state.map(|state| LoadedAutomationRuntimeState {
+                last_triggered_at: state.last_triggered_at,
+                last_trigger_fingerprint: state.last_trigger_fingerprint,
+                last_scheduled_at: state.last_scheduled_at,
+            }),
+            Err(error) => {
+                tracing::error!(automation = %automation_id, error = %error, "failed to load automation runtime state");
+                None
+            }
+        }
+    }
+
+    async fn save(&self, state: &AutomationRuntimeState) {
+        if let Err(error) = self.store.save_automation_runtime_state(state).await {
+            tracing::error!(automation = %state.automation_id, error = %error, "failed to save automation runtime state");
+        }
+    }
+}
+
+impl TriggerDecision {
+    fn is_skip(&self) -> bool {
+        matches!(self, Self::Skip)
+    }
+}
+
+async fn should_skip_trigger(
+    automation: &Automation,
+    event: &AttributeValue,
+    state_store: Option<&Arc<dyn DeviceStore>>,
+    scheduled_for: Option<DateTime<Utc>>,
+) -> TriggerDecision {
+    let policy = &automation.runtime_state_policy;
+    if policy.cooldown_secs.is_none() && policy.dedupe_window_secs.is_none() && !policy.resumable_schedule {
+        return TriggerDecision::Execute;
+    }
+
+    let Some(store) = state_store else {
+        return TriggerDecision::Execute;
+    };
+    let state_store = AutomationStateStore {
+        store: store.clone(),
+    };
+    let state = state_store.load(&automation.summary.id).await.unwrap_or_default();
+    let now = Utc::now();
+
+    if let Some(cooldown_secs) = policy.cooldown_secs {
+        if let Some(last_triggered_at) = state.last_triggered_at {
+            if now < last_triggered_at + ChronoDuration::seconds(cooldown_secs as i64) {
+                return TriggerDecision::Skip;
+            }
+        }
+    }
+
+    if let Some(dedupe_window_secs) = policy.dedupe_window_secs {
+        let fingerprint = trigger_fingerprint(event);
+        if let (Some(last_triggered_at), Some(last_fingerprint)) =
+            (state.last_triggered_at, state.last_trigger_fingerprint.as_deref())
+        {
+            if last_fingerprint == fingerprint
+                && now < last_triggered_at + ChronoDuration::seconds(dedupe_window_secs as i64)
+            {
+                return TriggerDecision::Skip;
+            }
+        }
+    }
+
+    if policy.resumable_schedule {
+        if let (Some(last_scheduled_at), Some(scheduled_for)) = (state.last_scheduled_at, scheduled_for) {
+            if scheduled_for <= last_scheduled_at {
+                return TriggerDecision::Skip;
+            }
+        }
+    }
+
+    TriggerDecision::Execute
+}
+
+async fn persist_runtime_state(
+    automation: &Automation,
+    event: &AttributeValue,
+    state_store: Option<&AutomationStateStore>,
+    scheduled_for: Option<DateTime<Utc>>,
+) {
+    let Some(state_store) = state_store else {
+        return;
+    };
+
+    state_store
+        .save(&AutomationRuntimeState {
+            updated_at: Utc::now(),
+            automation_id: automation.summary.id.clone(),
+            last_triggered_at: Some(Utc::now()),
+            last_trigger_fingerprint: Some(trigger_fingerprint(event).to_string()),
+            last_scheduled_at: scheduled_for,
+        })
+        .await;
+}
+
+async fn next_scheduled_fire_after(
+    automation: &Automation,
+    state_store: Option<AutomationStateStore>,
+    now: DateTime<Utc>,
+) -> Option<Option<DateTime<Utc>>> {
+    if !automation.runtime_state_policy.resumable_schedule {
+        return None;
+    }
+    let Some(state_store) = state_store else {
+        return None;
+    };
+
+    let state = state_store.load(&automation.summary.id).await.unwrap_or_default();
+    let anchor = state.last_scheduled_at.unwrap_or(now);
+    Some(next_schedule_time(&automation.trigger, anchor))
+}
+
+fn parse_runtime_state_policy(module: &mlua::Table, path: &Path) -> Result<RuntimeStatePolicy> {
+    let state = module.get::<Option<mlua::Table>>("state").map_err(|error| {
+        anyhow::anyhow!(
+            "automation file {} has invalid optional field 'state': {error}",
+            path.display()
+        )
+    })?;
+    let Some(state) = state else {
+        return Ok(RuntimeStatePolicy::default());
+    };
+
+    Ok(RuntimeStatePolicy {
+        cooldown_secs: state.get::<Option<u64>>("cooldown_secs").map_err(|error| {
+            anyhow::anyhow!(
+                "automation file {} has invalid optional state field 'cooldown_secs': {error}",
+                path.display()
+            )
+        })?,
+        dedupe_window_secs: state.get::<Option<u64>>("dedupe_window_secs").map_err(|error| {
+            anyhow::anyhow!(
+                "automation file {} has invalid optional state field 'dedupe_window_secs': {error}",
+                path.display()
+            )
+        })?,
+        resumable_schedule: state.get::<Option<bool>>("resumable_schedule").map_err(|error| {
+            anyhow::anyhow!(
+                "automation file {} has invalid optional state field 'resumable_schedule': {error}",
+                path.display()
+            )
+        })?.unwrap_or(false),
+    })
+}
+
+fn trigger_fingerprint(event: &AttributeValue) -> String {
+    serde_json::to_string(event).unwrap_or_else(|_| "null".to_string())
+}
+
+fn event_scheduled_at(event: &AttributeValue) -> Option<DateTime<Utc>> {
+    let AttributeValue::Object(fields) = event else {
+        return None;
+    };
+    let AttributeValue::Text(value) = fields.get("scheduled_at")? else {
+        return None;
+    };
+
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
 fn recover_lagged_event_automations(
     executions: &mut JoinSet<()>,
     runtime: Arc<Runtime>,
@@ -624,21 +1097,13 @@ fn recover_lagged_event_automations(
     execution: ExecutionControl,
     skipped: u64,
     observer: Option<Arc<dyn AutomationExecutionObserver>>,
+    state_store: Option<Arc<dyn DeviceStore>>,
 ) {
     for automation in &catalog.automations {
         if !catalog.is_enabled(&automation.summary.id).unwrap_or(true) {
             continue;
         }
-        let Trigger::DeviceStateChange { device_id, .. } = &automation.trigger else {
-            continue;
-        };
-
-        let Some(device) = runtime.registry().get(&DeviceId(device_id.clone())) else {
-            continue;
-        };
-
-        if let Some(event_value) = automation_event_from_device_snapshot(automation, &device, skipped)
-        {
+        if let Some(event_value) = automation_event_from_registry_snapshot(automation, runtime.registry(), skipped) {
             spawn_automation_execution(
                 executions,
                 automation.clone(),
@@ -647,6 +1112,9 @@ fn recover_lagged_event_automations(
                 scripts_root.clone(),
                 execution.clone(),
                 observer.clone(),
+                state_store.as_ref().map(|store| AutomationStateStore {
+                    store: store.clone(),
+                }),
             );
         }
     }
@@ -742,91 +1210,177 @@ fn automation_event_from_runtime_event(
     automation: &Automation,
     event: &Event,
 ) -> Option<AttributeValue> {
-    let Trigger::DeviceStateChange {
-        device_id,
-        attribute,
-        equals,
-    } = &automation.trigger
-    else {
-        return None;
-    };
-
-    let Event::DeviceStateChanged { id, attributes } = event else {
-        return None;
-    };
-
-    if &id.0 != device_id {
-        return None;
-    }
-
-    if let Some(attribute_name) = attribute {
-        let value = attributes.get(attribute_name)?;
-        if let Some(expected) = equals {
-            if value != expected {
+    match (&automation.trigger, event) {
+        (
+            Trigger::DeviceStateChange {
+                device_id,
+                attribute,
+                equals,
+            },
+            Event::DeviceStateChanged { id, attributes },
+        ) => {
+            if &id.0 != device_id {
                 return None;
             }
+
+            if let Some(attribute_name) = attribute {
+                let value = attributes.get(attribute_name)?;
+                if let Some(expected) = equals {
+                    if value != expected {
+                        return None;
+                    }
+                }
+
+                return Some(device_state_change_event(
+                    &id.0,
+                    attributes,
+                    Some(attribute_name.as_str()),
+                    Some(value.clone()),
+                    None,
+                ));
+            }
+
+            Some(device_state_change_event(
+                &id.0,
+                attributes,
+                None,
+                None,
+                None,
+            ))
         }
+        (
+            Trigger::DeviceRoomChange { device_id, room_id },
+            Event::DeviceRoomChanged { id, room_id: changed_room_id },
+        ) => {
+            if let Some(expected_device_id) = device_id {
+                if &id.0 != expected_device_id {
+                    return None;
+                }
+            }
+            if let Some(expected_room_id) = room_id {
+                if changed_room_id.as_ref().map(|value| value.0.as_str()) != Some(expected_room_id.as_str()) {
+                    return None;
+                }
+            }
 
-        return Some(device_state_change_event(
-            &id.0,
-            attributes,
-            Some(attribute_name.as_str()),
-            Some(value.clone()),
-            None,
-        ));
+            Some(device_room_change_event(&id.0, changed_room_id.as_ref().map(|value| value.0.as_str())))
+        }
+        (Trigger::RoomChange { room_id }, Event::RoomAdded { room })
+        | (Trigger::RoomChange { room_id }, Event::RoomUpdated { room }) => {
+            if room_id.as_deref().is_some_and(|expected| expected != room.id.0) {
+                return None;
+            }
+
+            Some(room_change_event(room, false))
+        }
+        (Trigger::RoomChange { room_id }, Event::RoomRemoved { id }) => {
+            if room_id.as_deref().is_some_and(|expected| expected != id.0) {
+                return None;
+            }
+
+            Some(room_removed_event(&id.0))
+        }
+        (
+            Trigger::AdapterLifecycle { adapter, event },
+            Event::AdapterStarted { adapter: started_adapter },
+        ) => {
+            if *event != AdapterLifecycleEvent::Started {
+                return None;
+            }
+            if adapter.as_deref().is_some_and(|expected| expected != started_adapter) {
+                return None;
+            }
+
+            Some(adapter_started_event(started_adapter))
+        }
+        (Trigger::SystemError { contains }, Event::SystemError { message }) => {
+            if contains.as_deref().is_some_and(|needle| !message.contains(needle)) {
+                return None;
+            }
+
+            Some(system_error_event(message))
+        }
+        _ => None,
     }
-
-    Some(device_state_change_event(
-        &id.0,
-        attributes,
-        None,
-        None,
-        None,
-    ))
 }
 
-fn automation_event_from_device_snapshot(
+fn automation_event_from_registry_snapshot(
     automation: &Automation,
-    device: &Device,
+    registry: &smart_home_core::registry::DeviceRegistry,
     skipped: u64,
 ) -> Option<AttributeValue> {
-    let Trigger::DeviceStateChange {
-        device_id,
-        attribute,
-        equals,
-    } = &automation.trigger
-    else {
-        return None;
-    };
+    match &automation.trigger {
+        Trigger::DeviceStateChange {
+            device_id,
+            attribute,
+            equals,
+        } => {
+            let device = registry.get(&DeviceId(device_id.clone()))?;
 
-    if device.id.0 != *device_id {
-        return None;
-    }
+            if let Some(attribute_name) = attribute {
+                let value = device.attributes.get(attribute_name)?;
+                if let Some(expected) = equals {
+                    if value != expected {
+                        return None;
+                    }
+                }
 
-    if let Some(attribute_name) = attribute {
-        let value = device.attributes.get(attribute_name)?;
-        if let Some(expected) = equals {
-            if value != expected {
-                return None;
+                return Some(device_state_change_event(
+                    &device.id.0,
+                    &device.attributes,
+                    Some(attribute_name.as_str()),
+                    Some(value.clone()),
+                    Some(skipped),
+                ));
             }
+
+            Some(device_state_change_event(
+                &device.id.0,
+                &device.attributes,
+                None,
+                None,
+                Some(skipped),
+            ))
         }
+        Trigger::DeviceRoomChange { device_id, room_id } => {
+            let device = match device_id {
+                Some(device_id) => registry.get(&DeviceId(device_id.clone()))?,
+                None => registry
+                    .list()
+                    .into_iter()
+                    .find(|device| match room_id {
+                        Some(expected_room_id) => {
+                            device.room_id.as_ref().map(|value| value.0.as_str())
+                                == Some(expected_room_id.as_str())
+                        }
+                        None => true,
+                    })?,
+            };
 
-        return Some(device_state_change_event(
-            &device.id.0,
-            &device.attributes,
-            Some(attribute_name.as_str()),
-            Some(value.clone()),
-            Some(skipped),
-        ));
+            if let Some(expected_room_id) = room_id {
+                if device.room_id.as_ref().map(|value| value.0.as_str()) != Some(expected_room_id.as_str()) {
+                    return None;
+                }
+            }
+
+            Some(recovered_event(
+                device_room_change_event(
+                    &device.id.0,
+                    device.room_id.as_ref().map(|value| value.0.as_str()),
+                ),
+                skipped,
+            ))
+        }
+        Trigger::RoomChange { room_id } => {
+            let room = match room_id {
+                Some(room_id) => registry.get_room(&smart_home_core::model::RoomId(room_id.clone()))?,
+                None => registry.list_rooms().into_iter().next()?,
+            };
+
+            Some(recovered_event(room_change_event(&room, false), skipped))
+        }
+        _ => None,
     }
-
-    Some(device_state_change_event(
-        &device.id.0,
-        &device.attributes,
-        None,
-        None,
-        Some(skipped),
-    ))
 }
 
 fn device_state_change_event(
@@ -871,6 +1425,110 @@ fn device_state_change_event(
     }
 
     AttributeValue::Object(event)
+}
+
+fn device_room_change_event(device_id: &str, room_id: Option<&str>) -> AttributeValue {
+    let mut event = HashMap::from([
+        (
+            "type".to_string(),
+            AttributeValue::Text("device_room_change".to_string()),
+        ),
+        (
+            "device_id".to_string(),
+            AttributeValue::Text(device_id.to_string()),
+        ),
+    ]);
+
+    event.insert(
+        "room_id".to_string(),
+        room_id
+            .map(|room_id| AttributeValue::Text(room_id.to_string()))
+            .unwrap_or(AttributeValue::Null),
+    );
+
+    AttributeValue::Object(event)
+}
+
+fn room_change_event(room: &smart_home_core::model::Room, recovered: bool) -> AttributeValue {
+    let mut event = HashMap::from([
+        (
+            "type".to_string(),
+            AttributeValue::Text("room_change".to_string()),
+        ),
+        (
+            "room_id".to_string(),
+            AttributeValue::Text(room.id.0.clone()),
+        ),
+        (
+            "name".to_string(),
+            AttributeValue::Text(room.name.clone()),
+        ),
+    ]);
+
+    if recovered {
+        event.insert("recovered".to_string(), AttributeValue::Bool(true));
+    }
+
+    AttributeValue::Object(event)
+}
+
+fn room_removed_event(room_id: &str) -> AttributeValue {
+    AttributeValue::Object(HashMap::from([
+        (
+            "type".to_string(),
+            AttributeValue::Text("room_change".to_string()),
+        ),
+        (
+            "room_id".to_string(),
+            AttributeValue::Text(room_id.to_string()),
+        ),
+        (
+            "removed".to_string(),
+            AttributeValue::Bool(true),
+        ),
+    ]))
+}
+
+fn adapter_started_event(adapter: &str) -> AttributeValue {
+    AttributeValue::Object(HashMap::from([
+        (
+            "type".to_string(),
+            AttributeValue::Text("adapter_lifecycle".to_string()),
+        ),
+        (
+            "adapter".to_string(),
+            AttributeValue::Text(adapter.to_string()),
+        ),
+        (
+            "event".to_string(),
+            AttributeValue::Text("started".to_string()),
+        ),
+    ]))
+}
+
+fn system_error_event(message: &str) -> AttributeValue {
+    AttributeValue::Object(HashMap::from([
+        (
+            "type".to_string(),
+            AttributeValue::Text("system_error".to_string()),
+        ),
+        (
+            "message".to_string(),
+            AttributeValue::Text(message.to_string()),
+        ),
+    ]))
+}
+
+fn recovered_event(event: AttributeValue, skipped: u64) -> AttributeValue {
+    let AttributeValue::Object(mut fields) = event else {
+        return event;
+    };
+    fields.insert("recovered".to_string(), AttributeValue::Bool(true));
+    fields.insert(
+        "skipped_events".to_string(),
+        AttributeValue::Integer(skipped as i64),
+    );
+    AttributeValue::Object(fields)
 }
 
 fn load_automation_file(path: &Path, scripts_root: Option<&Path>) -> Result<Automation> {
@@ -921,6 +1579,7 @@ fn load_automation_file(path: &Path, scripts_root: Option<&Path>) -> Result<Auto
                 path.display()
             )
         })?;
+    let runtime_state_policy = parse_runtime_state_policy(&module, path)?;
 
     Ok(Automation {
         summary: AutomationSummary {
@@ -931,6 +1590,7 @@ fn load_automation_file(path: &Path, scripts_root: Option<&Path>) -> Result<Auto
         },
         path: path.to_path_buf(),
         trigger,
+        runtime_state_policy,
     })
 }
 
@@ -1005,6 +1665,129 @@ fn parse_trigger(value: mlua::Value, path: &Path) -> Result<Trigger> {
                 equals,
             })
         }
+        "device_room_change" => {
+            let device_id = table.get::<Option<String>>("device_id").map_err(|error| {
+                anyhow::anyhow!(
+                    "automation file {} trigger field 'device_id' is invalid: {error}",
+                    path.display()
+                )
+            })?;
+            let room_id = table.get::<Option<String>>("room_id").map_err(|error| {
+                anyhow::anyhow!(
+                    "automation file {} trigger field 'room_id' is invalid: {error}",
+                    path.display()
+                )
+            })?;
+
+            if device_id.is_none() && room_id.is_none() {
+                bail!(
+                    "automation file {} device_room_change trigger requires 'device_id' or 'room_id'",
+                    path.display()
+                );
+            }
+
+            Ok(Trigger::DeviceRoomChange { device_id, room_id })
+        }
+        "room_change" => {
+            let room_id = table.get::<Option<String>>("room_id").map_err(|error| {
+                anyhow::anyhow!(
+                    "automation file {} trigger field 'room_id' is invalid: {error}",
+                    path.display()
+                )
+            })?;
+
+            Ok(Trigger::RoomChange { room_id })
+        }
+        "adapter_lifecycle" => {
+            let adapter = table.get::<Option<String>>("adapter").map_err(|error| {
+                anyhow::anyhow!(
+                    "automation file {} trigger field 'adapter' is invalid: {error}",
+                    path.display()
+                )
+            })?;
+            let event = match table.get::<String>("event").map_err(|error| {
+                anyhow::anyhow!(
+                    "automation file {} adapter_lifecycle trigger requires string 'event': {error}",
+                    path.display()
+                )
+            })?.as_str() {
+                "started" => AdapterLifecycleEvent::Started,
+                other => {
+                    bail!(
+                        "automation file {} adapter_lifecycle trigger has unsupported event '{}'; supported events are started",
+                        path.display(),
+                        other
+                    )
+                }
+            };
+
+            Ok(Trigger::AdapterLifecycle { adapter, event })
+        }
+        "system_error" => {
+            let contains = table.get::<Option<String>>("contains").map_err(|error| {
+                anyhow::anyhow!(
+                    "automation file {} trigger field 'contains' is invalid: {error}",
+                    path.display()
+                )
+            })?;
+
+            Ok(Trigger::SystemError { contains })
+        }
+        "wall_clock" => {
+            let hour = table.get::<u32>("hour").map_err(|error| {
+                anyhow::anyhow!(
+                    "automation file {} wall_clock trigger requires integer 'hour': {error}",
+                    path.display()
+                )
+            })?;
+            let minute = table.get::<u32>("minute").map_err(|error| {
+                anyhow::anyhow!(
+                    "automation file {} wall_clock trigger requires integer 'minute': {error}",
+                    path.display()
+                )
+            })?;
+
+            if hour > 23 {
+                bail!(
+                    "automation file {} wall_clock trigger 'hour' must be between 0 and 23",
+                    path.display()
+                );
+            }
+            if minute > 59 {
+                bail!(
+                    "automation file {} wall_clock trigger 'minute' must be between 0 and 59",
+                    path.display()
+                );
+            }
+
+            Ok(Trigger::WallClock { hour, minute })
+        }
+        "cron" => {
+            let expression = table.get::<String>("expression").map_err(|error| {
+                anyhow::anyhow!(
+                    "automation file {} cron trigger requires string 'expression': {error}",
+                    path.display()
+                )
+            })?;
+            let schedule = Schedule::from_str(&expression).map_err(|error| {
+                anyhow::anyhow!(
+                    "automation file {} cron trigger has invalid 'expression': {error}",
+                    path.display()
+                )
+            })?;
+
+            if schedule.after(&Utc::now()).next().is_none() {
+                bail!(
+                    "automation file {} cron trigger expression does not produce future occurrences",
+                    path.display()
+                );
+            }
+
+            Ok(Trigger::Cron {
+                expression,
+                schedule,
+            })
+        }
         "interval" => {
             let every_secs = table.get::<u64>("every_secs").map_err(|error| {
                 anyhow::anyhow!(
@@ -1022,7 +1805,7 @@ fn parse_trigger(value: mlua::Value, path: &Path) -> Result<Trigger> {
             Ok(Trigger::Interval { every_secs })
         }
         _ => bail!(
-            "automation file {} has unsupported trigger type '{}'; supported types are device_state_change and interval",
+            "automation file {} has unsupported trigger type '{}'; supported types are device_state_change, device_room_change, room_change, adapter_lifecycle, system_error, wall_clock, cron, and interval",
             path.display(),
             trigger_type
         ),
@@ -1032,22 +1815,42 @@ fn parse_trigger(value: mlua::Value, path: &Path) -> Result<Trigger> {
 fn trigger_type_name(trigger: &Trigger) -> &'static str {
     match trigger {
         Trigger::DeviceStateChange { .. } => "device_state_change",
+        Trigger::DeviceRoomChange { .. } => "device_room_change",
+        Trigger::RoomChange { .. } => "room_change",
+        Trigger::AdapterLifecycle { .. } => "adapter_lifecycle",
+        Trigger::SystemError { .. } => "system_error",
+        Trigger::WallClock { .. } => "wall_clock",
+        Trigger::Cron { .. } => "cron",
         Trigger::Interval { .. } => "interval",
     }
+}
+
+fn trigger_uses_event_bus(automation: &Automation) -> bool {
+    matches!(
+        automation.trigger,
+        Trigger::DeviceStateChange { .. }
+            | Trigger::DeviceRoomChange { .. }
+            | Trigger::RoomChange { .. }
+            | Trigger::AdapterLifecycle { .. }
+            | Trigger::SystemError { .. }
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::str::FromStr;
     use std::sync::Mutex;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::Result;
+    use chrono::{Datelike, NaiveDate, TimeZone, Timelike};
+    use cron::Schedule;
     use smart_home_core::adapter::Adapter;
     use smart_home_core::bus::EventBus;
     use smart_home_core::command::DeviceCommand;
-    use smart_home_core::model::{AttributeValue, Device, DeviceId, DeviceKind, Metadata};
+    use smart_home_core::model::{AttributeValue, Device, DeviceId, DeviceKind, Metadata, Room, RoomId};
     use smart_home_core::registry::DeviceRegistry;
     use smart_home_core::runtime::{Runtime, RuntimeConfig};
     use smart_home_core::store::AutomationExecutionHistoryEntry;
@@ -1065,9 +1868,47 @@ mod tests {
         entries: Mutex<Vec<AutomationExecutionHistoryEntry>>,
     }
 
+    #[derive(Default)]
+    struct MemoryStateStore {
+        automation_state: Mutex<HashMap<String, AutomationRuntimeState>>,
+    }
+
     impl AutomationExecutionObserver for RecordingObserver {
         fn record(&self, entry: AutomationExecutionHistoryEntry) {
             self.entries.lock().expect("observer lock").push(entry);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DeviceStore for MemoryStateStore {
+        async fn load_all_devices(&self) -> anyhow::Result<Vec<Device>> { Ok(Vec::new()) }
+        async fn load_all_rooms(&self) -> anyhow::Result<Vec<Room>> { Ok(Vec::new()) }
+        async fn save_device(&self, _device: &Device) -> anyhow::Result<()> { Ok(()) }
+        async fn save_room(&self, _room: &Room) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_device(&self, _id: &DeviceId) -> anyhow::Result<()> { Ok(()) }
+        async fn delete_room(&self, _id: &RoomId) -> anyhow::Result<()> { Ok(()) }
+        async fn load_device_history(&self, _id: &DeviceId, _start: Option<DateTime<Utc>>, _end: Option<DateTime<Utc>>, _limit: usize) -> anyhow::Result<Vec<smart_home_core::store::DeviceHistoryEntry>> { Ok(Vec::new()) }
+        async fn load_attribute_history(&self, _id: &DeviceId, _attribute: &str, _start: Option<DateTime<Utc>>, _end: Option<DateTime<Utc>>, _limit: usize) -> anyhow::Result<Vec<smart_home_core::store::AttributeHistoryEntry>> { Ok(Vec::new()) }
+        async fn save_command_audit(&self, _entry: &smart_home_core::store::CommandAuditEntry) -> anyhow::Result<()> { Ok(()) }
+        async fn load_command_audit(&self, _device_id: Option<&DeviceId>, _start: Option<DateTime<Utc>>, _end: Option<DateTime<Utc>>, _limit: usize) -> anyhow::Result<Vec<smart_home_core::store::CommandAuditEntry>> { Ok(Vec::new()) }
+        async fn save_scene_execution(&self, _entry: &smart_home_core::store::SceneExecutionHistoryEntry) -> anyhow::Result<()> { Ok(()) }
+        async fn load_scene_history(&self, _scene_id: &str, _start: Option<DateTime<Utc>>, _end: Option<DateTime<Utc>>, _limit: usize) -> anyhow::Result<Vec<smart_home_core::store::SceneExecutionHistoryEntry>> { Ok(Vec::new()) }
+        async fn save_automation_execution(&self, _entry: &AutomationExecutionHistoryEntry) -> anyhow::Result<()> { Ok(()) }
+        async fn load_automation_history(&self, _automation_id: &str, _start: Option<DateTime<Utc>>, _end: Option<DateTime<Utc>>, _limit: usize) -> anyhow::Result<Vec<AutomationExecutionHistoryEntry>> { Ok(Vec::new()) }
+        async fn load_automation_runtime_state(&self, automation_id: &str) -> anyhow::Result<Option<AutomationRuntimeState>> {
+            Ok(self
+                .automation_state
+                .lock()
+                .expect("automation state lock")
+                .get(automation_id)
+                .cloned())
+        }
+        async fn save_automation_runtime_state(&self, state: &AutomationRuntimeState) -> anyhow::Result<()> {
+            self.automation_state
+                .lock()
+                .expect("automation state lock")
+                .insert(state.automation_id.clone(), state.clone());
+            Ok(())
         }
     }
 
@@ -1153,6 +1994,13 @@ mod tests {
         }
     }
 
+    fn sample_room(id: &str, name: &str) -> Room {
+        Room {
+            id: RoomId(id.to_string()),
+            name: name.to_string(),
+        }
+    }
+
     #[test]
     fn loads_device_trigger_automation_catalog() {
         let dir = temp_dir("smart-home-automations");
@@ -1176,6 +2024,126 @@ mod tests {
         let catalog = AutomationCatalog::load_from_directory(&dir, None).expect("catalog loads");
         assert_eq!(catalog.summaries().len(), 1);
         assert_eq!(catalog.summaries()[0].trigger_type, "device_state_change");
+    }
+
+    #[test]
+    fn loads_extended_event_trigger_automation_catalog() {
+        let dir = temp_dir("smart-home-automations");
+        write_automation(
+            &dir,
+            "room.lua",
+            r#"return {
+                id = "room_watch",
+                name = "Room Watch",
+                trigger = {
+                    type = "room_change",
+                    room_id = "outside",
+                },
+                execute = function(ctx, event)
+                end
+            }"#,
+        );
+        write_automation(
+            &dir,
+            "adapter.lua",
+            r#"return {
+                id = "adapter_watch",
+                name = "Adapter Watch",
+                trigger = {
+                    type = "adapter_lifecycle",
+                    adapter = "test",
+                    event = "started",
+                },
+                execute = function(ctx, event)
+                end
+            }"#,
+        );
+
+        let catalog = AutomationCatalog::load_from_directory(&dir, None).expect("catalog loads");
+        let trigger_types = catalog
+            .summaries()
+            .into_iter()
+            .map(|summary| summary.trigger_type)
+            .collect::<Vec<_>>();
+        assert!(trigger_types.contains(&"room_change"));
+        assert!(trigger_types.contains(&"adapter_lifecycle"));
+    }
+
+    #[test]
+    fn loads_wall_clock_and_cron_trigger_catalog() {
+        let dir = temp_dir("smart-home-automations");
+        write_automation(
+            &dir,
+            "clock.lua",
+            r#"return {
+                id = "clock_watch",
+                name = "Clock Watch",
+                trigger = {
+                    type = "wall_clock",
+                    hour = 6,
+                    minute = 30,
+                },
+                execute = function(ctx, event)
+                end
+            }"#,
+        );
+        write_automation(
+            &dir,
+            "cron.lua",
+            r#"return {
+                id = "cron_watch",
+                name = "Cron Watch",
+                trigger = {
+                    type = "cron",
+                    expression = "0 */5 * * * * *",
+                },
+                execute = function(ctx, event)
+                end
+            }"#,
+        );
+
+        let catalog = AutomationCatalog::load_from_directory(&dir, None).expect("catalog loads");
+        let trigger_types = catalog
+            .summaries()
+            .into_iter()
+            .map(|summary| summary.trigger_type)
+            .collect::<Vec<_>>();
+        assert!(trigger_types.contains(&"wall_clock"));
+        assert!(trigger_types.contains(&"cron"));
+    }
+
+    #[test]
+    fn next_wall_clock_occurrence_rolls_to_next_day_after_past_time() {
+        let after = Utc.from_utc_datetime(
+            &NaiveDate::from_ymd_opt(2026, 4, 16)
+                .expect("valid date")
+                .and_hms_opt(6, 31, 0)
+                .expect("valid time"),
+        );
+
+        let next = next_wall_clock_occurrence(6, 30, after).expect("next schedule exists");
+        assert_eq!(next.day(), 17);
+        assert_eq!(next.hour(), 6);
+        assert_eq!(next.minute(), 30);
+    }
+
+    #[test]
+    fn next_schedule_time_uses_cron_expression() {
+        let trigger = Trigger::Cron {
+            expression: "0 */10 * * * * *".to_string(),
+            schedule: Schedule::from_str("0 */10 * * * * *").expect("cron parses"),
+        };
+        let after = Utc.from_utc_datetime(
+            &NaiveDate::from_ymd_opt(2026, 4, 16)
+                .expect("valid date")
+                .and_hms_opt(8, 7, 0)
+                .expect("valid time"),
+        );
+
+        let next = next_schedule_time(&trigger, after).expect("next schedule exists");
+        assert_eq!(next.hour(), 8);
+        assert_eq!(next.minute(), 10);
+        assert_eq!(next.second(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1246,6 +2214,510 @@ mod tests {
                 .get("brightness"),
             Some(&AttributeValue::Integer(42))
         );
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn automation_cooldown_skips_repeated_triggers_within_window() {
+        let dir = temp_dir("smart-home-automations");
+        write_automation(
+            &dir,
+            "cooldown.lua",
+            r#"return {
+                id = "cooldown_check",
+                name = "Cooldown Check",
+                state = {
+                    cooldown_secs = 60,
+                },
+                trigger = {
+                    type = "device_state_change",
+                    device_id = "test:rain",
+                    attribute = "custom.test.rain",
+                    equals = true,
+                },
+                execute = function(ctx, event)
+                    ctx:command("test:device", {
+                        capability = "brightness",
+                        action = "set",
+                        value = 42,
+                    })
+                end
+            }"#,
+        );
+
+        let runtime = Arc::new(Runtime::new(
+            vec![Box::new(CommandAdapter)],
+            RuntimeConfig { event_bus_capacity: 32 },
+        ));
+        let state_store = Arc::new(MemoryStateStore::default());
+        runtime.registry().upsert(sample_device("test:rain", false)).await.expect("sensor upsert succeeds");
+        runtime.registry().upsert(target_device("test:device")).await.expect("target exists");
+
+        let catalog = AutomationCatalog::load_from_directory(&dir, None).expect("catalog loads");
+        let runner = AutomationRunner::new(catalog)
+            .with_state_store(state_store.clone());
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runner.run(runtime).await }
+        });
+
+        sleep(Duration::from_millis(25)).await;
+        runtime.registry().upsert(sample_device("test:rain", true)).await.expect("first trigger");
+        sleep(Duration::from_millis(100)).await;
+        let first_state = state_store
+            .load_automation_runtime_state("cooldown_check")
+            .await
+            .expect("load state succeeds")
+            .expect("state exists");
+
+        runtime.registry().upsert(sample_device("test:rain", false)).await.expect("reset trigger");
+        runtime.registry().upsert(sample_device("test:rain", true)).await.expect("second trigger");
+        sleep(Duration::from_millis(100)).await;
+
+        let second_state = state_store
+            .load_automation_runtime_state("cooldown_check")
+            .await
+            .expect("load state succeeds")
+            .expect("state exists");
+        assert_eq!(second_state.last_triggered_at, first_state.last_triggered_at);
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn automation_dedupe_window_skips_identical_trigger_payloads() {
+        let dir = temp_dir("smart-home-automations");
+        write_automation(
+            &dir,
+            "dedupe.lua",
+            r#"return {
+                id = "dedupe_check",
+                name = "Dedupe Check",
+                state = {
+                    dedupe_window_secs = 60,
+                },
+                trigger = {
+                    type = "system_error",
+                    contains = "boom",
+                },
+                execute = function(ctx, event)
+                    ctx:command("test:device", {
+                        capability = "brightness",
+                        action = "set",
+                        value = 7,
+                    })
+                end
+            }"#,
+        );
+
+        let runtime = Arc::new(Runtime::new(
+            vec![Box::new(CommandAdapter)],
+            RuntimeConfig { event_bus_capacity: 32 },
+        ));
+        let state_store = Arc::new(MemoryStateStore::default());
+        runtime.registry().upsert(target_device("test:device")).await.expect("target exists");
+
+        let catalog = AutomationCatalog::load_from_directory(&dir, None).expect("catalog loads");
+        let runner = AutomationRunner::new(catalog)
+            .with_state_store(state_store.clone());
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runner.run(runtime).await }
+        });
+
+        sleep(Duration::from_millis(25)).await;
+        runtime.bus().publish(Event::SystemError { message: "boom".to_string() });
+        sleep(Duration::from_millis(100)).await;
+        let first_state = state_store
+            .load_automation_runtime_state("dedupe_check")
+            .await
+            .expect("load state succeeds")
+            .expect("state exists");
+
+        runtime.bus().publish(Event::SystemError { message: "boom".to_string() });
+        sleep(Duration::from_millis(100)).await;
+        let second_state = state_store
+            .load_automation_runtime_state("dedupe_check")
+            .await
+            .expect("load state succeeds")
+            .expect("state exists");
+        assert_eq!(second_state.last_triggered_at, first_state.last_triggered_at);
+        assert_eq!(second_state.last_trigger_fingerprint, first_state.last_trigger_fingerprint);
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn resumable_schedule_uses_persisted_last_scheduled_time() {
+        let dir = temp_dir("smart-home-automations");
+        write_automation(
+            &dir,
+            "resume.lua",
+            r#"return {
+                id = "resume_check",
+                name = "Resume Check",
+                state = {
+                    resumable_schedule = true,
+                },
+                trigger = {
+                    type = "wall_clock",
+                    hour = 6,
+                    minute = 30,
+                },
+                execute = function(ctx, event)
+                end
+            }"#,
+        );
+        let catalog = AutomationCatalog::load_from_directory(&dir, None).expect("catalog loads");
+        let automation = catalog.automations.first().expect("automation exists");
+        let state_store = AutomationStateStore {
+            store: Arc::new(MemoryStateStore {
+                automation_state: Mutex::new(HashMap::from([(
+                    "resume_check".to_string(),
+                    AutomationRuntimeState {
+                        updated_at: Utc::now(),
+                        automation_id: "resume_check".to_string(),
+                        last_triggered_at: None,
+                        last_trigger_fingerprint: None,
+                        last_scheduled_at: Some(Utc.from_utc_datetime(
+                            &NaiveDate::from_ymd_opt(2026, 4, 16)
+                                .expect("valid date")
+                                .and_hms_opt(6, 30, 0)
+                                .expect("valid time"),
+                        )),
+                    },
+                )])),
+            }),
+        };
+        let now = Utc.from_utc_datetime(
+            &NaiveDate::from_ymd_opt(2026, 4, 16)
+                .expect("valid date")
+                .and_hms_opt(7, 0, 0)
+                .expect("valid time"),
+        );
+
+        let next = next_scheduled_fire_after(automation, Some(state_store), now)
+            .await
+            .flatten()
+            .expect("next resumed schedule exists");
+        assert_eq!(next.day(), 17);
+        assert_eq!(next.hour(), 6);
+        assert_eq!(next.minute(), 30);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wall_clock_automation_executes_on_schedule() {
+        let dir = temp_dir("smart-home-automations");
+        let scheduled_for = Utc::now() + ChronoDuration::minutes(1);
+        write_automation(
+            &dir,
+            "clock.lua",
+            &format!(
+                r#"return {{
+                    id = "clock_watch",
+                    name = "Clock Watch",
+                    trigger = {{
+                        type = "wall_clock",
+                        hour = {},
+                        minute = {},
+                    }},
+                    execute = function(ctx, event)
+                        if event.type == "wall_clock" then
+                            ctx:command("test:device", {{
+                                capability = "brightness",
+                                action = "set",
+                                value = event.minute,
+                            }})
+                        end
+                    end
+                }}"#,
+                scheduled_for.hour(),
+                scheduled_for.minute(),
+            ),
+        );
+
+        let runtime = Arc::new(Runtime::new(
+            vec![Box::new(CommandAdapter)],
+            RuntimeConfig {
+                event_bus_capacity: 32,
+            },
+        ));
+        runtime
+            .registry()
+            .upsert(target_device("test:device"))
+            .await
+            .expect("target device exists");
+
+        let catalog = AutomationCatalog::load_from_directory(&dir, None).expect("catalog loads");
+        let runner = AutomationRunner::new(catalog);
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runner.run(runtime).await;
+            }
+        });
+
+        timeout(Duration::from_secs(90), async {
+            loop {
+                if runtime
+                    .registry()
+                    .get(&DeviceId("test:device".to_string()))
+                    .expect("target device exists")
+                    .attributes
+                    .get("brightness")
+                    == Some(&AttributeValue::Integer(scheduled_for.minute() as i64))
+                {
+                    break;
+                }
+
+                sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .expect("wall clock automation executes");
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn device_room_change_automation_executes_on_room_assignment() {
+        let dir = temp_dir("smart-home-automations");
+        write_automation(
+            &dir,
+            "room.lua",
+            r#"return {
+                id = "room_assignment",
+                name = "Room Assignment",
+                trigger = {
+                    type = "device_room_change",
+                    device_id = "test:roomed",
+                    room_id = "outside",
+                },
+                execute = function(ctx, event)
+                    if event.room_id == "outside" then
+                        ctx:command("test:device", {
+                            capability = "brightness",
+                            action = "set",
+                            value = 61,
+                        })
+                    end
+                end
+            }"#,
+        );
+
+        let runtime = Arc::new(Runtime::new(
+            vec![Box::new(CommandAdapter)],
+            RuntimeConfig {
+                event_bus_capacity: 32,
+            },
+        ));
+        runtime
+            .registry()
+            .upsert_room(sample_room("outside", "Outside"))
+            .await;
+        runtime
+            .registry()
+            .upsert(sample_device("test:roomed", false))
+            .await
+            .expect("roomed device exists");
+        runtime
+            .registry()
+            .upsert(target_device("test:device"))
+            .await
+            .expect("target device exists");
+
+        let catalog = AutomationCatalog::load_from_directory(&dir, None).expect("catalog loads");
+        let runner = AutomationRunner::new(catalog);
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runner.run(runtime).await;
+            }
+        });
+
+        sleep(Duration::from_millis(25)).await;
+
+        runtime
+            .registry()
+            .assign_device_to_room(
+                &DeviceId("test:roomed".to_string()),
+                Some(RoomId("outside".to_string())),
+            )
+            .await
+            .expect("room assignment succeeds");
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if runtime
+                    .registry()
+                    .get(&DeviceId("test:device".to_string()))
+                    .expect("target device exists")
+                    .attributes
+                    .get("brightness")
+                    == Some(&AttributeValue::Integer(61))
+                {
+                    break;
+                }
+
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("device room change automation executes");
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adapter_lifecycle_automation_executes_on_started_event() {
+        let dir = temp_dir("smart-home-automations");
+        write_automation(
+            &dir,
+            "adapter.lua",
+            r#"return {
+                id = "adapter_started",
+                name = "Adapter Started",
+                trigger = {
+                    type = "adapter_lifecycle",
+                    adapter = "test",
+                    event = "started",
+                },
+                execute = function(ctx, event)
+                    if event.adapter == "test" and event.event == "started" then
+                        ctx:command("test:device", {
+                            capability = "brightness",
+                            action = "set",
+                            value = 15,
+                        })
+                    end
+                end
+            }"#,
+        );
+
+        let runtime = Arc::new(Runtime::new(
+            vec![Box::new(CommandAdapter)],
+            RuntimeConfig {
+                event_bus_capacity: 32,
+            },
+        ));
+        runtime
+            .registry()
+            .upsert(target_device("test:device"))
+            .await
+            .expect("target device exists");
+
+        let catalog = AutomationCatalog::load_from_directory(&dir, None).expect("catalog loads");
+        let runner = AutomationRunner::new(catalog);
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runner.run(runtime).await;
+            }
+        });
+
+        sleep(Duration::from_millis(25)).await;
+        runtime.bus().publish(Event::AdapterStarted {
+            adapter: "test".to_string(),
+        });
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if runtime
+                    .registry()
+                    .get(&DeviceId("test:device".to_string()))
+                    .expect("target device exists")
+                    .attributes
+                    .get("brightness")
+                    == Some(&AttributeValue::Integer(15))
+                {
+                    break;
+                }
+
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("adapter lifecycle automation executes");
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn system_error_automation_executes_on_matching_error() {
+        let dir = temp_dir("smart-home-automations");
+        write_automation(
+            &dir,
+            "error.lua",
+            r#"return {
+                id = "error_watch",
+                name = "Error Watch",
+                trigger = {
+                    type = "system_error",
+                    contains = "adapter 'failing'",
+                },
+                execute = function(ctx, event)
+                    if string.find(event.message, "failing", 1, true) then
+                        ctx:command("test:device", {
+                            capability = "brightness",
+                            action = "set",
+                            value = 88,
+                        })
+                    end
+                end
+            }"#,
+        );
+
+        let runtime = Arc::new(Runtime::new(
+            vec![Box::new(CommandAdapter)],
+            RuntimeConfig {
+                event_bus_capacity: 32,
+            },
+        ));
+        runtime
+            .registry()
+            .upsert(target_device("test:device"))
+            .await
+            .expect("target device exists");
+
+        let catalog = AutomationCatalog::load_from_directory(&dir, None).expect("catalog loads");
+        let runner = AutomationRunner::new(catalog);
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runner.run(runtime).await;
+            }
+        });
+
+        sleep(Duration::from_millis(25)).await;
+        runtime.bus().publish(Event::SystemError {
+            message: "adapter 'failing' failed: boom".to_string(),
+        });
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if runtime
+                    .registry()
+                    .get(&DeviceId("test:device".to_string()))
+                    .expect("target device exists")
+                    .attributes
+                    .get("brightness")
+                    == Some(&AttributeValue::Integer(88))
+                {
+                    break;
+                }
+
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("system error automation executes");
 
         task.abort();
         let _ = task.await;
@@ -1550,7 +3022,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn lagged_event_runner_recovers_matching_device_state_from_registry_snapshot() {
+    async fn lag_recovery_executes_matching_device_state_from_registry_snapshot() {
         let dir = temp_dir("smart-home-automations");
         write_automation(
             &dir,
@@ -1594,56 +3066,47 @@ mod tests {
             .expect("target device exists");
 
         let catalog = AutomationCatalog::load_from_directory(&dir, None).expect("catalog loads");
-        let runner = AutomationRunner::new(catalog);
-        let task = tokio::spawn({
-            let runtime = runtime.clone();
-            async move {
-                runner.run(runtime).await;
-            }
-        });
-
-        sleep(Duration::from_millis(25)).await;
-
-        runtime.bus().publish(Event::DeviceSeen {
-            id: DeviceId("test:noise-1".to_string()),
-            last_seen: Utc::now(),
-        });
-        runtime.bus().publish(Event::DeviceSeen {
-            id: DeviceId("test:noise-2".to_string()),
-            last_seen: Utc::now(),
-        });
         runtime
             .registry()
             .upsert(sample_device("test:rain", true))
             .await
             .expect("matching device state is updated in registry");
 
+        let mut executions = JoinSet::new();
+        recover_lagged_event_automations(
+            &mut executions,
+            runtime.clone(),
+            &catalog,
+            None,
+            ExecutionControl {
+                semaphore: Arc::new(Semaphore::new(1)),
+                timeout: Duration::from_secs(1),
+            },
+            2,
+            None,
+            None,
+        );
+
         let recovered_value = timeout(Duration::from_secs(2), async {
-            loop {
-                let brightness = runtime
-                    .registry()
-                    .get(&DeviceId("test:device".to_string()))
-                    .expect("target device exists")
-                    .attributes
-                    .get("brightness")
-                    .cloned();
+            executions.join_next().await;
+            let brightness = runtime
+                .registry()
+                .get(&DeviceId("test:device".to_string()))
+                .expect("target device exists")
+                .attributes
+                .get("brightness")
+                .cloned()
+                .expect("brightness is set by recovered automation");
 
-                if let Some(AttributeValue::Integer(value)) = brightness {
-                    if value > 0 {
-                        break value;
-                    }
-                }
-
-                sleep(Duration::from_millis(10)).await;
+            match brightness {
+                AttributeValue::Integer(value) => value,
+                other => panic!("unexpected brightness value: {other:?}"),
             }
         })
         .await
         .expect("lag recovery should execute automation");
 
-        assert!(recovered_value >= 1);
-
-        task.abort();
-        let _ = task.await;
+        assert_eq!(recovered_value, 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

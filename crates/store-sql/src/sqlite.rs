@@ -8,7 +8,7 @@ use smart_home_core::model::{
     AttributeValue, Attributes, Device, DeviceId, DeviceKind, Metadata, Room, RoomId,
 };
 use smart_home_core::store::{
-    AttributeHistoryEntry, AutomationExecutionHistoryEntry, CommandAuditEntry,
+    AttributeHistoryEntry, AutomationExecutionHistoryEntry, AutomationRuntimeState, CommandAuditEntry,
     DeviceHistoryEntry, DeviceStore, SceneExecutionHistoryEntry,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -121,8 +121,19 @@ CREATE INDEX IF NOT EXISTS idx_automation_history_automation_time
 ON automation_execution_history(automation_id, executed_at DESC)
 "#;
 
+const CREATE_AUTOMATION_RUNTIME_STATE_TABLE_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS automation_runtime_state (
+    automation_id TEXT PRIMARY KEY,
+    updated_at TEXT NOT NULL,
+    last_triggered_at TEXT,
+    last_trigger_fingerprint TEXT,
+    last_scheduled_at TEXT
+)
+"#;
+
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 const SCHEMA_VERSION_V1: i64 = 1;
+const SCHEMA_VERSION_V2: i64 = 2;
 
 #[derive(Debug, Clone)]
 pub struct SqliteHistoryConfig {
@@ -203,6 +214,9 @@ impl SqliteDeviceStore {
         if schema_version < 1 {
             self.migrate_to_v1().await?;
         }
+        if schema_version < 2 {
+            self.migrate_to_v2().await?;
+        }
 
         Ok(())
     }
@@ -277,6 +291,28 @@ impl SqliteDeviceStore {
         )
         .bind(SCHEMA_VERSION_KEY)
         .bind(SCHEMA_VERSION_V1.to_string())
+        .execute(&self.pool)
+        .await
+        .context("failed to write SQLite schema version")?;
+
+        Ok(())
+    }
+
+    async fn migrate_to_v2(&self) -> Result<()> {
+        sqlx::query(CREATE_AUTOMATION_RUNTIME_STATE_TABLE_SQL)
+            .execute(&self.pool)
+            .await
+            .context("failed to create SQLite automation runtime state table")?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO schema_metadata (key, value)
+            VALUES (?1, ?2)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+        )
+        .bind(SCHEMA_VERSION_KEY)
+        .bind(SCHEMA_VERSION_V2.to_string())
         .execute(&self.pool)
         .await
         .context("failed to write SQLite schema version")?;
@@ -829,6 +865,55 @@ impl DeviceStore for SqliteDeviceStore {
 
         rows.into_iter().map(automation_history_from_row).collect()
     }
+
+    async fn load_automation_runtime_state(
+        &self,
+        automation_id: &str,
+    ) -> Result<Option<AutomationRuntimeState>> {
+        sqlx::query(
+            r#"
+            SELECT automation_id, updated_at, last_triggered_at, last_trigger_fingerprint, last_scheduled_at
+            FROM automation_runtime_state
+            WHERE automation_id = ?1
+            "#,
+        )
+        .bind(automation_id)
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("failed to load automation runtime state for '{automation_id}'"))?
+        .map(automation_runtime_state_from_row)
+        .transpose()
+    }
+
+    async fn save_automation_runtime_state(&self, state: &AutomationRuntimeState) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO automation_runtime_state (
+                automation_id,
+                updated_at,
+                last_triggered_at,
+                last_trigger_fingerprint,
+                last_scheduled_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(automation_id) DO UPDATE SET
+                updated_at = excluded.updated_at,
+                last_triggered_at = excluded.last_triggered_at,
+                last_trigger_fingerprint = excluded.last_trigger_fingerprint,
+                last_scheduled_at = excluded.last_scheduled_at
+            "#,
+        )
+        .bind(&state.automation_id)
+        .bind(state.updated_at.to_rfc3339())
+        .bind(state.last_triggered_at.map(|value| value.to_rfc3339()))
+        .bind(&state.last_trigger_fingerprint)
+        .bind(state.last_scheduled_at.map(|value| value.to_rfc3339()))
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("failed to save automation runtime state for '{}'", state.automation_id))?;
+
+        Ok(())
+    }
 }
 
 fn sqlite_connect_options(database_url: &str, auto_create: bool) -> Result<SqliteConnectOptions> {
@@ -970,6 +1055,34 @@ fn automation_history_from_row(
         duration_ms: row.get::<i64, _>("duration_ms"),
         error: row.get::<Option<String>, _>("error"),
         results,
+    })
+}
+
+fn automation_runtime_state_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<AutomationRuntimeState> {
+    Ok(AutomationRuntimeState {
+        automation_id: row.get::<String, _>("automation_id"),
+        updated_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("updated_at"))
+            .context("invalid automation runtime state updated_at")?
+            .with_timezone(&Utc),
+        last_triggered_at: row
+            .get::<Option<String>, _>("last_triggered_at")
+            .map(|value| {
+                DateTime::parse_from_rfc3339(&value)
+                    .context("invalid automation runtime state last_triggered_at")
+                    .map(|value| value.with_timezone(&Utc))
+            })
+            .transpose()?,
+        last_trigger_fingerprint: row.get::<Option<String>, _>("last_trigger_fingerprint"),
+        last_scheduled_at: row
+            .get::<Option<String>, _>("last_scheduled_at")
+            .map(|value| {
+                DateTime::parse_from_rfc3339(&value)
+                    .context("invalid automation runtime state last_scheduled_at")
+                    .map(|value| value.with_timezone(&Utc))
+            })
+            .transpose()?,
     })
 }
 
@@ -1392,6 +1505,31 @@ mod tests {
             .await
             .expect("load automation history succeeds");
         assert_eq!(entries, vec![entry]);
+    }
+
+    #[tokio::test]
+    async fn saves_and_loads_automation_runtime_state() {
+        let store = temp_store().await;
+        let updated_at = Utc::now();
+        let state = AutomationRuntimeState {
+            updated_at,
+            automation_id: "rain_check".to_string(),
+            last_triggered_at: Some(updated_at),
+            last_trigger_fingerprint: Some("{\"type\":\"interval\"}".to_string()),
+            last_scheduled_at: Some(updated_at),
+        };
+
+        store
+            .save_automation_runtime_state(&state)
+            .await
+            .expect("save runtime state succeeds");
+
+        let loaded = store
+            .load_automation_runtime_state("rain_check")
+            .await
+            .expect("load runtime state succeeds")
+            .expect("runtime state exists");
+        assert_eq!(loaded, state);
     }
 
     #[tokio::test]

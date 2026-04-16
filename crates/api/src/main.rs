@@ -598,9 +598,19 @@ async fn main() -> Result<()> {
         }
     });
     let automation_runner = if let Some(observer) = automation_observer.clone() {
-        AutomationRunner::new((*automations).clone()).with_observer(observer)
+        let runner = AutomationRunner::new((*automations).clone()).with_observer(observer);
+        if let Some(store) = device_store.clone() {
+            runner.with_state_store(store)
+        } else {
+            runner
+        }
     } else {
-        AutomationRunner::new((*automations).clone())
+        let runner = AutomationRunner::new((*automations).clone());
+        if let Some(store) = device_store.clone() {
+            runner.with_state_store(store)
+        } else {
+            runner
+        }
     };
     let automation_control = Arc::new(automation_runner.controller());
 
@@ -1928,6 +1938,7 @@ mod tests {
         AttributeValue, Device, DeviceId, DeviceKind, Metadata, Room, RoomId,
     };
     use smart_home_core::runtime::RuntimeConfig;
+    use smart_home_core::store::AutomationRuntimeState;
     use smart_home_scenes::SceneCatalog;
     use store_sql::{SqliteDeviceStore, SqliteHistoryConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1954,6 +1965,7 @@ mod tests {
         command_audit: Mutex<Vec<CommandAuditEntry>>,
         scene_history: Mutex<HashMap<String, Vec<SceneExecutionHistoryEntry>>>,
         automation_history: Mutex<HashMap<String, Vec<AutomationExecutionHistoryEntry>>>,
+        automation_runtime_state: Mutex<HashMap<String, AutomationRuntimeState>>,
         first_save_started: Notify,
         first_save_seen: Mutex<bool>,
         delay_first_save: Mutex<bool>,
@@ -1980,6 +1992,7 @@ mod tests {
                 command_audit: Mutex::new(Vec::new()),
                 scene_history: Mutex::new(HashMap::new()),
                 automation_history: Mutex::new(HashMap::new()),
+                automation_runtime_state: Mutex::new(HashMap::new()),
                 first_save_started: Notify::new(),
                 first_save_seen: Mutex::new(false),
                 delay_first_save: Mutex::new(true),
@@ -2242,6 +2255,29 @@ mod tests {
             entries.sort_by(|a, b| b.executed_at.cmp(&a.executed_at));
             entries.truncate(limit);
             Ok(entries)
+        }
+
+        async fn load_automation_runtime_state(
+            &self,
+            automation_id: &str,
+        ) -> anyhow::Result<Option<AutomationRuntimeState>> {
+            Ok(self
+                .automation_runtime_state
+                .lock()
+                .expect("automation runtime state lock")
+                .get(automation_id)
+                .cloned())
+        }
+
+        async fn save_automation_runtime_state(
+            &self,
+            state: &AutomationRuntimeState,
+        ) -> anyhow::Result<()> {
+            self.automation_runtime_state
+                .lock()
+                .expect("automation runtime state lock")
+                .insert(state.automation_id.clone(), state.clone());
+            Ok(())
         }
     }
 

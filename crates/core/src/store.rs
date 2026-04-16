@@ -56,6 +56,15 @@ pub struct AutomationExecutionHistoryEntry {
     pub results: Vec<SceneStepResult>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutomationRuntimeState {
+    pub updated_at: DateTime<Utc>,
+    pub automation_id: String,
+    pub last_triggered_at: Option<DateTime<Utc>>,
+    pub last_trigger_fingerprint: Option<String>,
+    pub last_scheduled_at: Option<DateTime<Utc>>,
+}
+
 #[async_trait::async_trait]
 pub trait DeviceStore: Send + Sync + 'static {
     async fn load_all_devices(&self) -> anyhow::Result<Vec<Device>>;
@@ -106,4 +115,12 @@ pub trait DeviceStore: Send + Sync + 'static {
         end: Option<DateTime<Utc>>,
         limit: usize,
     ) -> anyhow::Result<Vec<AutomationExecutionHistoryEntry>>;
+    async fn load_automation_runtime_state(
+        &self,
+        automation_id: &str,
+    ) -> anyhow::Result<Option<AutomationRuntimeState>>;
+    async fn save_automation_runtime_state(
+        &self,
+        state: &AutomationRuntimeState,
+    ) -> anyhow::Result<()>;
 }
