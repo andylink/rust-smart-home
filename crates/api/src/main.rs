@@ -21,7 +21,7 @@ use smart_home_automations::{
 };
 use smart_home_core::adapter::{registered_adapter_factories, Adapter};
 use smart_home_core::command::DeviceCommand;
-use smart_home_core::config::{Config, PersistenceBackend};
+use smart_home_core::config::{Config, PersistenceBackend, TelemetrySelectionConfig};
 use smart_home_core::event::Event;
 use smart_home_core::model::{DeviceId, Room, RoomId};
 use smart_home_core::runtime::Runtime;
@@ -30,7 +30,7 @@ use smart_home_core::store::{
     DeviceHistoryEntry, DeviceStore, SceneExecutionHistoryEntry, SceneStepResult,
 };
 use smart_home_scenes::{SceneCatalog, SceneExecutionResult, SceneSummary};
-use store_sql::{SqliteDeviceStore, SqliteHistoryConfig};
+use store_sql::{HistorySelection, SqliteDeviceStore, SqliteHistoryConfig};
 use tracing::Level;
 
 #[derive(Clone, Serialize)]
@@ -570,6 +570,7 @@ async fn create_device_store(config: &Config) -> Result<Option<Arc<dyn DeviceSto
                         .history
                         .retention_days
                         .map(|days| Duration::from_secs(days.saturating_mul(24 * 60 * 60))),
+                    selection: history_selection_from_config(config),
                 },
             )
             .await
@@ -581,6 +582,22 @@ async fn create_device_store(config: &Config) -> Result<Option<Arc<dyn DeviceSto
     };
 
     Ok(Some(store))
+}
+
+fn history_selection_from_config(config: &Config) -> HistorySelection {
+    if !config.telemetry.enabled {
+        return HistorySelection::default();
+    }
+
+    history_selection_from_telemetry(&config.telemetry.selection)
+}
+
+fn history_selection_from_telemetry(selection: &TelemetrySelectionConfig) -> HistorySelection {
+    HistorySelection {
+        device_ids: selection.device_ids.clone(),
+        capabilities: selection.capabilities.clone(),
+        adapter_names: selection.adapter_names.clone(),
+    }
 }
 
 async fn monitor_runtime_health(runtime: Arc<Runtime>, health: HealthState) {
@@ -1945,6 +1962,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn telemetry_selection_only_applies_when_telemetry_is_enabled() {
+        let mut config = test_config(serde_json::Map::new());
+        config.telemetry.enabled = false;
+        config.telemetry.selection.device_ids = vec!["test:device".to_string()];
+        config.telemetry.selection.capabilities = vec!["brightness".to_string()];
+        config.telemetry.selection.adapter_names = vec!["test".to_string()];
+
+        let selection = history_selection_from_config(&config);
+        assert!(selection.device_ids.is_empty());
+        assert!(selection.capabilities.is_empty());
+        assert!(selection.adapter_names.is_empty());
+
+        config.telemetry.enabled = true;
+        let selection = history_selection_from_config(&config);
+        assert_eq!(selection.device_ids, vec!["test:device"]);
+        assert_eq!(selection.capabilities, vec!["brightness"]);
+        assert_eq!(selection.adapter_names, vec!["test"]);
+    }
+
     fn test_health(adapter_names: &[&str]) -> HealthState {
         let health = HealthState::new(
             &adapter_names.iter().map(|name| (*name).to_string()).collect::<Vec<_>>(),
@@ -2489,6 +2526,7 @@ mod tests {
                 SqliteHistoryConfig {
                     enabled: true,
                     retention: None,
+                    selection: HistorySelection::default(),
                 },
             )
             .await
@@ -2565,6 +2603,7 @@ mod tests {
                 SqliteHistoryConfig {
                     enabled: true,
                     retention: None,
+                    selection: HistorySelection::default(),
                 },
             )
             .await
@@ -2640,6 +2679,7 @@ mod tests {
                 SqliteHistoryConfig {
                     enabled: true,
                     retention: None,
+                    selection: HistorySelection::default(),
                 },
             )
             .await
@@ -2714,6 +2754,7 @@ mod tests {
                 SqliteHistoryConfig {
                     enabled: true,
                     retention: None,
+                    selection: HistorySelection::default(),
                 },
             )
             .await
@@ -2820,6 +2861,7 @@ mod tests {
                 SqliteHistoryConfig {
                     enabled: true,
                     retention: None,
+                    selection: HistorySelection::default(),
                 },
             )
             .await

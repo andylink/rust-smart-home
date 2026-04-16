@@ -128,6 +128,14 @@ const SCHEMA_VERSION_V1: i64 = 1;
 pub struct SqliteHistoryConfig {
     pub enabled: bool,
     pub retention: Option<Duration>,
+    pub selection: HistorySelection,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HistorySelection {
+    pub device_ids: Vec<String>,
+    pub capabilities: Vec<String>,
+    pub adapter_names: Vec<String>,
 }
 
 impl Default for SqliteHistoryConfig {
@@ -135,6 +143,7 @@ impl Default for SqliteHistoryConfig {
         Self {
             enabled: true,
             retention: None,
+            selection: HistorySelection::default(),
         }
     }
 }
@@ -307,7 +316,7 @@ impl SqliteDeviceStore {
             })
             .unwrap_or(true);
 
-        if should_record_device {
+        if should_record_device && self.should_record_device(device) {
             let device_json = serde_json::to_string(device).with_context(|| {
                 format!("failed to serialize device history for '{}'", device.id.0)
             })?;
@@ -326,6 +335,10 @@ impl SqliteDeviceStore {
         }
 
         for (attribute, value) in &device.attributes {
+            if !self.should_record_attribute(device, attribute) {
+                continue;
+            }
+
             let changed = previous
                 .and_then(|existing| existing.attributes.get(attribute))
                 .map(|previous| previous != value)
@@ -387,6 +400,90 @@ impl SqliteDeviceStore {
             .context("failed to prune SQLite attribute history")?;
 
         Ok(())
+    }
+
+    fn should_record_device(&self, device: &Device) -> bool {
+        self.selection_allows_device(&device.id.0, &device.metadata.source)
+    }
+
+    fn should_record_attribute(&self, device: &Device, attribute: &str) -> bool {
+        self.selection_allows_device(&device.id.0, &device.metadata.source)
+            && self.selection_allows_capability(attribute)
+    }
+
+    fn should_record_command_audit(&self, entry: &CommandAuditEntry) -> bool {
+        self.selection_allows_device(&entry.device_id.0, device_adapter_name(&entry.device_id.0))
+            && self.selection_allows_capability(&entry.command.capability)
+    }
+
+    fn should_record_scene_execution(&self, entry: &SceneExecutionHistoryEntry) -> bool {
+        if self.history.selection.adapter_names.is_empty() && self.history.selection.capabilities.is_empty() {
+            return true;
+        }
+
+        entry.results.iter().any(|result| {
+            self.selection_allows_device(&result.target, device_adapter_name(&result.target))
+        })
+    }
+
+    fn should_record_automation_execution(&self, entry: &AutomationExecutionHistoryEntry) -> bool {
+        if !self.selection_allows_trigger_payload(&entry.trigger_payload) {
+            return false;
+        }
+
+        if self.history.selection.capabilities.is_empty() && self.history.selection.adapter_names.is_empty() {
+            return true;
+        }
+
+        entry.results.iter().any(|result| {
+            self.selection_allows_device(&result.target, device_adapter_name(&result.target))
+        }) || entry.results.is_empty()
+    }
+
+    fn selection_allows_device(&self, device_id: &str, adapter_name: &str) -> bool {
+        let device_match = self.history.selection.device_ids.is_empty()
+            || self.history.selection.device_ids.iter().any(|candidate| candidate == device_id);
+        let adapter_match = self.history.selection.adapter_names.is_empty()
+            || self
+                .history
+                .selection
+                .adapter_names
+                .iter()
+                .any(|candidate| candidate == adapter_name);
+
+        device_match && adapter_match
+    }
+
+    fn selection_allows_capability(&self, capability: &str) -> bool {
+        self.history.selection.capabilities.is_empty()
+            || self
+                .history
+                .selection
+                .capabilities
+                .iter()
+                .any(|candidate| candidate == capability)
+    }
+
+    fn selection_allows_trigger_payload(&self, payload: &AttributeValue) -> bool {
+        let AttributeValue::Object(fields) = payload else {
+            return self.history.selection.device_ids.is_empty()
+                && self.history.selection.adapter_names.is_empty();
+        };
+
+        let device_id = fields.get("device_id").and_then(attribute_text);
+        let attribute = fields.get("attribute").and_then(attribute_text);
+
+        let device_match = match device_id {
+            Some(device_id) => self.selection_allows_device(device_id, device_adapter_name(device_id)),
+            None => self.history.selection.device_ids.is_empty()
+                && self.history.selection.adapter_names.is_empty(),
+        };
+        let capability_match = match attribute {
+            Some(attribute) => self.selection_allows_capability(attribute),
+            None => self.history.selection.capabilities.is_empty(),
+        };
+
+        device_match && capability_match
     }
 }
 
@@ -563,6 +660,10 @@ impl DeviceStore for SqliteDeviceStore {
     }
 
     async fn save_command_audit(&self, entry: &CommandAuditEntry) -> Result<()> {
+        if !self.history.enabled || !self.should_record_command_audit(entry) {
+            return Ok(());
+        }
+
         let command_json = serde_json::to_string(&entry.command)
             .context("failed to serialize command audit entry")?;
 
@@ -616,6 +717,10 @@ impl DeviceStore for SqliteDeviceStore {
     }
 
     async fn save_scene_execution(&self, entry: &SceneExecutionHistoryEntry) -> Result<()> {
+        if !self.history.enabled || !self.should_record_scene_execution(entry) {
+            return Ok(());
+        }
+
         let results_json = serde_json::to_string(&entry.results)
             .context("failed to serialize scene execution history entry")?;
 
@@ -667,6 +772,10 @@ impl DeviceStore for SqliteDeviceStore {
     }
 
     async fn save_automation_execution(&self, entry: &AutomationExecutionHistoryEntry) -> Result<()> {
+        if !self.history.enabled || !self.should_record_automation_execution(entry) {
+            return Ok(());
+        }
+
         let trigger_payload_json = serde_json::to_string(&entry.trigger_payload)
             .context("failed to serialize automation trigger payload")?;
         let results_json = serde_json::to_string(&entry.results)
@@ -890,6 +999,17 @@ fn device_kind_from_str(value: &str) -> Result<DeviceKind> {
     }
 }
 
+fn attribute_text(value: &AttributeValue) -> Option<&str> {
+    match value {
+        AttributeValue::Text(value) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn device_adapter_name(device_id: &str) -> &str {
+    device_id.split_once(':').map(|(adapter, _)| adapter).unwrap_or(device_id)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -897,6 +1017,7 @@ mod tests {
 
     use chrono::Duration as ChronoDuration;
     use smart_home_core::capability::{measurement_value, TEMPERATURE_OUTDOOR};
+    use smart_home_core::command::DeviceCommand;
     use smart_home_core::model::{AttributeValue, DeviceKind};
     use smart_home_core::store::SceneStepResult;
 
@@ -1153,6 +1274,7 @@ mod tests {
         let store = temp_store_with_history(SqliteHistoryConfig {
             enabled: true,
             retention: Some(Duration::from_secs(60)),
+            selection: HistorySelection::default(),
         })
         .await;
         store
@@ -1270,5 +1392,210 @@ mod tests {
             .await
             .expect("load automation history succeeds");
         assert_eq!(entries, vec![entry]);
+    }
+
+    #[tokio::test]
+    async fn telemetry_selection_filters_device_and_attribute_history() {
+        let store = temp_store_with_history(SqliteHistoryConfig {
+            enabled: true,
+            retention: None,
+            selection: HistorySelection {
+                device_ids: vec!["test:allowed".to_string()],
+                capabilities: vec![TEMPERATURE_OUTDOOR.to_string()],
+                adapter_names: Vec::new(),
+            },
+        })
+        .await;
+        store
+            .save_room(&Room {
+                id: RoomId("lab".to_string()),
+                name: "Lab".to_string(),
+            })
+            .await
+            .expect("save room succeeds");
+
+        let allowed = sample_device_with_timestamp("test:allowed", 20.0, Utc::now());
+        let blocked = sample_device_with_timestamp("test:blocked", 21.0, Utc::now());
+
+        store.save_device(&allowed).await.expect("allowed save succeeds");
+        store.save_device(&blocked).await.expect("blocked save succeeds");
+
+        assert_eq!(
+            store
+                .load_device_history(&allowed.id, None, None, 10)
+                .await
+                .expect("allowed history loads")
+                .len(),
+            1
+        );
+        assert!(store
+            .load_device_history(&blocked.id, None, None, 10)
+            .await
+            .expect("blocked history loads")
+            .is_empty());
+        assert_eq!(
+            store
+                .load_attribute_history(&allowed.id, TEMPERATURE_OUTDOOR, None, None, 10)
+                .await
+                .expect("allowed attribute history loads")
+                .len(),
+            1
+        );
+        assert!(store
+            .load_attribute_history(&allowed.id, "online", None, None, 10)
+            .await
+            .expect("filtered attribute history loads")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn telemetry_selection_filters_command_scene_and_automation_history() {
+        let store = temp_store_with_history(SqliteHistoryConfig {
+            enabled: true,
+            retention: None,
+            selection: HistorySelection {
+                device_ids: vec!["test:allowed".to_string()],
+                capabilities: vec!["brightness".to_string()],
+                adapter_names: Vec::new(),
+            },
+        })
+        .await;
+
+        store
+            .save_command_audit(&CommandAuditEntry {
+                recorded_at: Utc::now(),
+                source: "device".to_string(),
+                room_id: None,
+                device_id: DeviceId("test:allowed".to_string()),
+                command: DeviceCommand {
+                    capability: "brightness".to_string(),
+                    action: "set".to_string(),
+                    value: Some(AttributeValue::Integer(42)),
+                },
+                status: "ok".to_string(),
+                message: None,
+            })
+            .await
+            .expect("allowed command audit saves");
+        store
+            .save_command_audit(&CommandAuditEntry {
+                recorded_at: Utc::now(),
+                source: "device".to_string(),
+                room_id: None,
+                device_id: DeviceId("test:blocked".to_string()),
+                command: DeviceCommand {
+                    capability: "brightness".to_string(),
+                    action: "set".to_string(),
+                    value: Some(AttributeValue::Integer(42)),
+                },
+                status: "ok".to_string(),
+                message: None,
+            })
+            .await
+            .expect("blocked command audit save succeeds");
+        assert_eq!(
+            store
+                .load_command_audit(None, None, None, 10)
+                .await
+                .expect("command audit loads")
+                .len(),
+            1
+        );
+
+        store
+            .save_scene_execution(&SceneExecutionHistoryEntry {
+                executed_at: Utc::now(),
+                scene_id: "scene".to_string(),
+                status: "ok".to_string(),
+                error: None,
+                results: vec![SceneStepResult {
+                    target: "test:allowed".to_string(),
+                    status: "ok".to_string(),
+                    message: None,
+                }],
+            })
+            .await
+            .expect("allowed scene save succeeds");
+        store
+            .save_scene_execution(&SceneExecutionHistoryEntry {
+                executed_at: Utc::now(),
+                scene_id: "scene".to_string(),
+                status: "ok".to_string(),
+                error: None,
+                results: vec![SceneStepResult {
+                    target: "test:blocked".to_string(),
+                    status: "ok".to_string(),
+                    message: None,
+                }],
+            })
+            .await
+            .expect("blocked scene save succeeds");
+        assert_eq!(
+            store
+                .load_scene_history("scene", None, None, 10)
+                .await
+                .expect("scene history loads")
+                .len(),
+            1
+        );
+
+        store
+            .save_automation_execution(&AutomationExecutionHistoryEntry {
+                executed_at: Utc::now(),
+                automation_id: "rain_check".to_string(),
+                trigger_payload: AttributeValue::Object(HashMap::from([
+                    (
+                        "device_id".to_string(),
+                        AttributeValue::Text("test:allowed".to_string()),
+                    ),
+                    (
+                        "attribute".to_string(),
+                        AttributeValue::Text("brightness".to_string()),
+                    ),
+                ])),
+                status: "ok".to_string(),
+                duration_ms: 10,
+                error: None,
+                results: vec![SceneStepResult {
+                    target: "test:allowed".to_string(),
+                    status: "ok".to_string(),
+                    message: None,
+                }],
+            })
+            .await
+            .expect("allowed automation save succeeds");
+        store
+            .save_automation_execution(&AutomationExecutionHistoryEntry {
+                executed_at: Utc::now(),
+                automation_id: "rain_check".to_string(),
+                trigger_payload: AttributeValue::Object(HashMap::from([
+                    (
+                        "device_id".to_string(),
+                        AttributeValue::Text("test:blocked".to_string()),
+                    ),
+                    (
+                        "attribute".to_string(),
+                        AttributeValue::Text("brightness".to_string()),
+                    ),
+                ])),
+                status: "ok".to_string(),
+                duration_ms: 10,
+                error: None,
+                results: vec![SceneStepResult {
+                    target: "test:blocked".to_string(),
+                    status: "ok".to_string(),
+                    message: None,
+                }],
+            })
+            .await
+            .expect("blocked automation save succeeds");
+        assert_eq!(
+            store
+                .load_automation_history("rain_check", None, None, 10)
+                .await
+                .expect("automation history loads")
+                .len(),
+            1
+        );
     }
 }

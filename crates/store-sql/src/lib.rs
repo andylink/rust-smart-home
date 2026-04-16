@@ -1,3 +1,3 @@
 pub mod sqlite;
 
-pub use sqlite::{SqliteDeviceStore, SqliteHistoryConfig};
+pub use sqlite::{HistorySelection, SqliteDeviceStore, SqliteHistoryConfig};
