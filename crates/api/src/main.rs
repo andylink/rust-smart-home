@@ -24,7 +24,10 @@ use smart_home_core::config::{Config, PersistenceBackend};
 use smart_home_core::event::Event;
 use smart_home_core::model::{DeviceId, Room, RoomId};
 use smart_home_core::runtime::Runtime;
-use smart_home_core::store::{AttributeHistoryEntry, DeviceHistoryEntry, DeviceStore};
+use smart_home_core::store::{
+    AttributeHistoryEntry, CommandAuditEntry, DeviceHistoryEntry, DeviceStore,
+    SceneExecutionHistoryEntry, SceneStepResult,
+};
 use smart_home_scenes::{SceneCatalog, SceneExecutionResult, SceneSummary};
 use store_sql::{SqliteDeviceStore, SqliteHistoryConfig};
 use tracing::Level;
@@ -139,6 +142,17 @@ struct AttributeHistoryResponse {
     device_id: String,
     attribute: String,
     entries: Vec<AttributeHistoryEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct CommandAuditResponse {
+    entries: Vec<CommandAuditEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct SceneHistoryResponse {
+    scene_id: String,
+    entries: Vec<SceneExecutionHistoryEntry>,
 }
 
 impl ComponentStatus {
@@ -796,6 +810,7 @@ fn app(state: AppState) -> Router {
         .route("/ready", get(ready))
         .route("/adapters", get(adapters))
         .route("/scenes", get(list_scenes))
+        .route("/scenes/{id}/history", get(get_scene_history))
         .route("/scenes/{id}/execute", post(execute_scene))
         .route("/rooms", get(list_rooms).post(create_room))
         .route("/rooms/{id}", get(get_room))
@@ -808,6 +823,7 @@ fn app(state: AppState) -> Router {
             "/devices/{id}/history/{attribute}",
             get(get_attribute_history),
         )
+        .route("/audit/commands", get(get_command_audit))
         .route("/devices/{id}/room", post(assign_device_room))
         .route("/devices/{id}/command", post(command_device))
         .route("/events", get(events))
@@ -841,17 +857,68 @@ async fn execute_scene(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SceneExecuteResponse>, ApiError> {
-    let Some(results) = state
+    let executed_at = Utc::now();
+    let execution = state
         .scenes
         .execute(&id, state.runtime.clone())
-        .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.to_string()))?
-    else {
+        .map_err(|error| {
+            persist_scene_history(
+                &state,
+                SceneExecutionHistoryEntry {
+                    executed_at,
+                    scene_id: id.clone(),
+                    status: "error".to_string(),
+                    error: Some(error.to_string()),
+                    results: Vec::new(),
+                },
+            );
+            ApiError::new(StatusCode::BAD_REQUEST, error.to_string())
+        })?;
+    let Some(results) = execution else {
         return Err(ApiError::not_found(format!("scene '{id}' not found")));
     };
+
+    persist_scene_history(
+        &state,
+        SceneExecutionHistoryEntry {
+            executed_at,
+            scene_id: id.clone(),
+            status: "ok".to_string(),
+            error: None,
+            results: results
+                .iter()
+                .map(|result| SceneStepResult {
+                    target: result.target.clone(),
+                    status: result.status.to_string(),
+                    message: result.message.clone(),
+                })
+                .collect(),
+        },
+    );
 
     Ok(Json(SceneExecuteResponse {
         status: "ok",
         results,
+    }))
+}
+
+async fn get_scene_history(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<SceneHistoryResponse>, ApiError> {
+    let store = history_store(&state)?;
+    ensure_history_query_range(&query)?;
+    let limit = state.history.resolve_limit(query.limit)?;
+
+    let entries = store
+        .load_scene_history(&id, query.start, query.end, limit)
+        .await
+        .map_err(internal_api_error)?;
+
+    Ok(Json(SceneHistoryResponse {
+        scene_id: id,
+        entries,
     }))
 }
 
@@ -1016,12 +1083,49 @@ async fn command_device(
         .validate()
         .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
 
-    match state.runtime.command_device(&device_id, command).await {
-        Ok(true) => Ok(Json(json!({ "status": "ok" }))),
+    let command_to_run = command.clone();
+    match state.runtime.command_device(&device_id, command_to_run).await {
+        Ok(true) => {
+            persist_command_audit(
+                &state,
+                CommandAuditEntry {
+                    recorded_at: Utc::now(),
+                    source: "device".to_string(),
+                    room_id: state
+                        .runtime
+                        .registry()
+                        .get(&device_id)
+                        .and_then(|device| device.room_id),
+                    device_id: device_id.clone(),
+                    command,
+                    status: "ok".to_string(),
+                    message: None,
+                },
+            );
+            Ok(Json(json!({ "status": "ok" })))
+        }
         Ok(false) => Err(ApiError::not_implemented(format!(
             "device commands are not implemented for '{id}'"
         ))),
-        Err(error) => Err(ApiError::new(StatusCode::BAD_REQUEST, error.to_string())),
+        Err(error) => {
+            persist_command_audit(
+                &state,
+                CommandAuditEntry {
+                    recorded_at: Utc::now(),
+                    source: "device".to_string(),
+                    room_id: state
+                        .runtime
+                        .registry()
+                        .get(&device_id)
+                        .and_then(|device| device.room_id),
+                    device_id: device_id.clone(),
+                    command,
+                    status: "error".to_string(),
+                    message: Some(error.to_string()),
+                },
+            );
+            Err(ApiError::new(StatusCode::BAD_REQUEST, error.to_string()))
+        }
     }
 }
 
@@ -1044,30 +1148,89 @@ async fn command_room_devices(
 
     for device in devices {
         let device_id = device.id.clone();
+        let audit_command = command.clone();
         match state
             .runtime
             .command_device(&device_id, command.clone())
             .await
         {
-            Ok(true) => results.push(RoomCommandResult {
-                device_id: device_id.0,
-                status: "ok",
-                message: None,
-            }),
-            Ok(false) => results.push(RoomCommandResult {
-                device_id: device_id.0,
-                status: "unsupported",
-                message: Some("device commands are not implemented".to_string()),
-            }),
-            Err(error) => results.push(RoomCommandResult {
-                device_id: device_id.0,
-                status: "error",
-                message: Some(error.to_string()),
-            }),
+            Ok(true) => {
+                persist_command_audit(
+                    &state,
+                    CommandAuditEntry {
+                        recorded_at: Utc::now(),
+                        source: "room".to_string(),
+                        room_id: Some(room_id.clone()),
+                        device_id: device_id.clone(),
+                        command: audit_command,
+                        status: "ok".to_string(),
+                        message: None,
+                    },
+                );
+                results.push(RoomCommandResult {
+                    device_id: device_id.0,
+                    status: "ok",
+                    message: None,
+                });
+            }
+            Ok(false) => {
+                persist_command_audit(
+                    &state,
+                    CommandAuditEntry {
+                        recorded_at: Utc::now(),
+                        source: "room".to_string(),
+                        room_id: Some(room_id.clone()),
+                        device_id: device_id.clone(),
+                        command: audit_command,
+                        status: "unsupported".to_string(),
+                        message: Some("device commands are not implemented".to_string()),
+                    },
+                );
+                results.push(RoomCommandResult {
+                    device_id: device_id.0,
+                    status: "unsupported",
+                    message: Some("device commands are not implemented".to_string()),
+                });
+            }
+            Err(error) => {
+                persist_command_audit(
+                    &state,
+                    CommandAuditEntry {
+                        recorded_at: Utc::now(),
+                        source: "room".to_string(),
+                        room_id: Some(room_id.clone()),
+                        device_id: device_id.clone(),
+                        command: audit_command,
+                        status: "error".to_string(),
+                        message: Some(error.to_string()),
+                    },
+                );
+                results.push(RoomCommandResult {
+                    device_id: device_id.0,
+                    status: "error",
+                    message: Some(error.to_string()),
+                });
+            }
         }
     }
 
     Ok(Json(results))
+}
+
+async fn get_command_audit(
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<CommandAuditResponse>, ApiError> {
+    let store = history_store(&state)?;
+    ensure_history_query_range(&query)?;
+    let limit = state.history.resolve_limit(query.limit)?;
+
+    let entries = store
+        .load_command_audit(None, query.start, query.end, limit)
+        .await
+        .map_err(internal_api_error)?;
+
+    Ok(Json(CommandAuditResponse { entries }))
 }
 
 async fn events(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -1114,6 +1277,36 @@ fn ensure_device_exists(state: &AppState, device_id: &DeviceId, raw_id: &str) ->
 fn internal_api_error(error: anyhow::Error) -> ApiError {
     tracing::error!(error = %error, "internal API error");
     ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+}
+
+fn persist_command_audit(state: &AppState, entry: CommandAuditEntry) {
+    let Some(store) = state.store.clone() else {
+        return;
+    };
+    if !state.history.enabled {
+        return;
+    }
+
+    tokio::spawn(async move {
+        if let Err(error) = store.save_command_audit(&entry).await {
+            tracing::error!(error = %error, device_id = %entry.device_id.0, "failed to persist command audit history");
+        }
+    });
+}
+
+fn persist_scene_history(state: &AppState, entry: SceneExecutionHistoryEntry) {
+    let Some(store) = state.store.clone() else {
+        return;
+    };
+    if !state.history.enabled {
+        return;
+    }
+
+    tokio::spawn(async move {
+        if let Err(error) = store.save_scene_execution(&entry).await {
+            tracing::error!(error = %error, scene_id = %entry.scene_id, "failed to persist scene execution history");
+        }
+    });
 }
 
 async fn handle_events_socket(mut socket: WebSocket, runtime: Arc<Runtime>) {
@@ -1238,6 +1431,8 @@ mod tests {
         rooms: Mutex<HashMap<RoomId, Room>>,
         device_history: Mutex<HashMap<DeviceId, Vec<DeviceHistoryEntry>>>,
         attribute_history: Mutex<HashMap<(DeviceId, String), Vec<AttributeHistoryEntry>>>,
+        command_audit: Mutex<Vec<CommandAuditEntry>>,
+        scene_history: Mutex<HashMap<String, Vec<SceneExecutionHistoryEntry>>>,
         first_save_started: Notify,
         first_save_seen: Mutex<bool>,
         delay_first_save: Mutex<bool>,
@@ -1250,6 +1445,8 @@ mod tests {
                 rooms: Mutex::new(HashMap::new()),
                 device_history: Mutex::new(HashMap::new()),
                 attribute_history: Mutex::new(HashMap::new()),
+                command_audit: Mutex::new(Vec::new()),
+                scene_history: Mutex::new(HashMap::new()),
                 first_save_started: Notify::new(),
                 first_save_seen: Mutex::new(false),
                 delay_first_save: Mutex::new(true),
@@ -1405,6 +1602,76 @@ mod tests {
                 .rev()
                 .take(limit)
                 .collect();
+            Ok(entries)
+        }
+
+        async fn save_command_audit(&self, entry: &CommandAuditEntry) -> anyhow::Result<()> {
+            self.command_audit
+                .lock()
+                .expect("command audit lock")
+                .push(entry.clone());
+            Ok(())
+        }
+
+        async fn load_command_audit(
+            &self,
+            device_id: Option<&DeviceId>,
+            start: Option<DateTime<Utc>>,
+            end: Option<DateTime<Utc>>,
+            limit: usize,
+        ) -> anyhow::Result<Vec<CommandAuditEntry>> {
+            let mut entries = self
+                .command_audit
+                .lock()
+                .expect("command audit lock")
+                .clone()
+                .into_iter()
+                .filter(|entry| {
+                    device_id
+                        .map(|value| &entry.device_id == value)
+                        .unwrap_or(true)
+                })
+                .filter(|entry| start.map(|value| entry.recorded_at >= value).unwrap_or(true))
+                .filter(|entry| end.map(|value| entry.recorded_at <= value).unwrap_or(true))
+                .collect::<Vec<_>>();
+            entries.sort_by(|a, b| b.recorded_at.cmp(&a.recorded_at));
+            entries.truncate(limit);
+            Ok(entries)
+        }
+
+        async fn save_scene_execution(
+            &self,
+            entry: &SceneExecutionHistoryEntry,
+        ) -> anyhow::Result<()> {
+            self.scene_history
+                .lock()
+                .expect("scene history lock")
+                .entry(entry.scene_id.clone())
+                .or_default()
+                .push(entry.clone());
+            Ok(())
+        }
+
+        async fn load_scene_history(
+            &self,
+            scene_id: &str,
+            start: Option<DateTime<Utc>>,
+            end: Option<DateTime<Utc>>,
+            limit: usize,
+        ) -> anyhow::Result<Vec<SceneExecutionHistoryEntry>> {
+            let mut entries = self
+                .scene_history
+                .lock()
+                .expect("scene history lock")
+                .get(scene_id)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|entry| start.map(|value| entry.executed_at >= value).unwrap_or(true))
+                .filter(|entry| end.map(|value| entry.executed_at <= value).unwrap_or(true))
+                .collect::<Vec<_>>();
+            entries.sort_by(|a, b| b.executed_at.cmp(&a.executed_at));
+            entries.truncate(limit);
             Ok(entries)
         }
     }
@@ -2266,6 +2533,186 @@ mod tests {
         assert_eq!(body["entries"][0]["value"]["value"], 22.0);
 
         let _ = shutdown.send(());
+        handle.await.expect("server task completes");
+    }
+
+    #[tokio::test]
+    async fn command_audit_endpoint_returns_recorded_commands() {
+        let database_url = temp_sqlite_url();
+        let store = Arc::new(
+            SqliteDeviceStore::new_with_history(
+                &database_url,
+                true,
+                SqliteHistoryConfig {
+                    enabled: true,
+                    retention: None,
+                },
+            )
+            .await
+            .expect("sqlite store initializes"),
+        );
+        let runtime = Arc::new(Runtime::new(
+            vec![Box::new(CommandAdapter)],
+            RuntimeConfig {
+                event_bus_capacity: 16,
+            },
+        ));
+        runtime
+            .registry()
+            .upsert(sample_device(
+                "test:device",
+                TEMPERATURE_OUTDOOR,
+                measurement_value(20.0, "celsius"),
+            ))
+            .await
+            .expect("test device exists");
+
+        let (addr, shutdown, handle) =
+            spawn_test_server_with_store(runtime.clone(), store.clone(), true).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/devices/test:device/command"))
+            .json(&json!({
+                "capability": "brightness",
+                "action": "set",
+                "value": 42
+            }))
+            .send()
+            .await
+            .expect("command request succeeds");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let entries = store
+                    .load_command_audit(None, None, None, 10)
+                    .await
+                    .expect("command audit loads");
+                if !entries.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("command audit persists in time");
+
+        let audit = reqwest::get(format!("http://{addr}/audit/commands"))
+            .await
+            .expect("command audit request succeeds");
+        assert_eq!(audit.status(), StatusCode::OK);
+        let body = audit.json::<Value>().await.expect("command audit json body");
+        assert_eq!(body["entries"].as_array().expect("entries array").len(), 1);
+        assert_eq!(body["entries"][0]["device_id"], "test:device");
+        assert_eq!(body["entries"][0]["status"], "ok");
+
+        let _ = shutdown.send(());
+        handle.await.expect("server task completes");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scene_history_endpoint_returns_recorded_scene_runs() {
+        let database_url = temp_sqlite_url();
+        let store = Arc::new(
+            SqliteDeviceStore::new_with_history(
+                &database_url,
+                true,
+                SqliteHistoryConfig {
+                    enabled: true,
+                    retention: None,
+                },
+            )
+            .await
+            .expect("sqlite store initializes"),
+        );
+        let runtime = Arc::new(Runtime::new(
+            vec![Box::new(CommandAdapter)],
+            RuntimeConfig {
+                event_bus_capacity: 16,
+            },
+        ));
+        runtime
+            .registry()
+            .upsert(sample_device(
+                "test:device",
+                TEMPERATURE_OUTDOOR,
+                measurement_value(20.0, "celsius"),
+            ))
+            .await
+            .expect("test device exists");
+
+        let scene_dir = write_temp_scene_dir(&[(
+            "set-brightness.lua",
+            r#"return {
+                id = "set_brightness",
+                name = "Set Brightness",
+                execute = function(ctx)
+                    ctx:command("test:device", {
+                        capability = "brightness",
+                        action = "set",
+                        value = 42,
+                    })
+                end
+            }"#,
+        )]);
+        let scenes = Arc::new(
+            SceneCatalog::load_from_directory(&scene_dir, None).expect("scenes load"),
+        );
+
+        let app = app(AppState {
+            runtime: runtime.clone(),
+            scenes,
+            health: test_health(&["open_meteo"]),
+            store: Some(store.clone()),
+            history: history_settings(true),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("read test listener address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("test server exits cleanly");
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/scenes/set_brightness/execute"))
+            .send()
+            .await
+            .expect("scene execute request succeeds");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let entries = store
+                    .load_scene_history("set_brightness", None, None, 10)
+                    .await
+                    .expect("scene history loads");
+                if !entries.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scene history persists in time");
+
+        let history = reqwest::get(format!("http://{addr}/scenes/set_brightness/history"))
+            .await
+            .expect("scene history request succeeds");
+        assert_eq!(history.status(), StatusCode::OK);
+        let body = history.json::<Value>().await.expect("scene history json body");
+        assert_eq!(body["scene_id"], "set_brightness");
+        assert_eq!(body["entries"].as_array().expect("entries array").len(), 1);
+        assert_eq!(body["entries"][0]["status"], "ok");
+        assert_eq!(body["entries"][0]["results"][0]["target"], "test:device");
+
+        let _ = shutdown_tx.send(());
         handle.await.expect("server task completes");
     }
 

@@ -7,7 +7,10 @@ use chrono::{DateTime, Utc};
 use smart_home_core::model::{
     AttributeValue, Attributes, Device, DeviceId, DeviceKind, Metadata, Room, RoomId,
 };
-use smart_home_core::store::{AttributeHistoryEntry, DeviceHistoryEntry, DeviceStore};
+use smart_home_core::store::{
+    AttributeHistoryEntry, CommandAuditEntry, DeviceHistoryEntry, DeviceStore,
+    SceneExecutionHistoryEntry,
+};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
@@ -64,6 +67,40 @@ ON device_history(device_id, observed_at DESC)
 const CREATE_ATTRIBUTE_HISTORY_INDEX_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_attribute_history_device_attr_time
 ON attribute_history(device_id, attribute, observed_at DESC)
+"#;
+
+const CREATE_COMMAND_AUDIT_TABLE_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS command_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at TEXT NOT NULL,
+    source TEXT NOT NULL,
+    room_id TEXT,
+    device_id TEXT NOT NULL,
+    command_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    message TEXT
+)
+"#;
+
+const CREATE_COMMAND_AUDIT_INDEX_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_command_audit_device_time
+ON command_audit(device_id, recorded_at DESC)
+"#;
+
+const CREATE_SCENE_HISTORY_TABLE_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS scene_execution_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    executed_at TEXT NOT NULL,
+    scene_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error TEXT,
+    results_json TEXT NOT NULL
+)
+"#;
+
+const CREATE_SCENE_HISTORY_INDEX_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_scene_history_scene_time
+ON scene_execution_history(scene_id, executed_at DESC)
 "#;
 
 const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -173,6 +210,26 @@ impl SqliteDeviceStore {
             .execute(&self.pool)
             .await
             .context("failed to create SQLite attribute history index")?;
+
+        sqlx::query(CREATE_COMMAND_AUDIT_TABLE_SQL)
+            .execute(&self.pool)
+            .await
+            .context("failed to create SQLite command audit table")?;
+
+        sqlx::query(CREATE_COMMAND_AUDIT_INDEX_SQL)
+            .execute(&self.pool)
+            .await
+            .context("failed to create SQLite command audit index")?;
+
+        sqlx::query(CREATE_SCENE_HISTORY_TABLE_SQL)
+            .execute(&self.pool)
+            .await
+            .context("failed to create SQLite scene history table")?;
+
+        sqlx::query(CREATE_SCENE_HISTORY_INDEX_SQL)
+            .execute(&self.pool)
+            .await
+            .context("failed to create SQLite scene history index")?;
 
         sqlx::query(
             r#"
@@ -476,6 +533,110 @@ impl DeviceStore for SqliteDeviceStore {
 
         rows.into_iter().map(attribute_history_from_row).collect()
     }
+
+    async fn save_command_audit(&self, entry: &CommandAuditEntry) -> Result<()> {
+        let command_json = serde_json::to_string(&entry.command)
+            .context("failed to serialize command audit entry")?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO command_audit (recorded_at, source, room_id, device_id, command_json, status, message)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+        )
+        .bind(entry.recorded_at.to_rfc3339())
+        .bind(&entry.source)
+        .bind(entry.room_id.as_ref().map(|id| id.0.as_str()))
+        .bind(&entry.device_id.0)
+        .bind(command_json)
+        .bind(&entry.status)
+        .bind(&entry.message)
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("failed to save command audit for '{}'", entry.device_id.0))?;
+
+        Ok(())
+    }
+
+    async fn load_command_audit(
+        &self,
+        device_id: Option<&DeviceId>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<Vec<CommandAuditEntry>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT recorded_at, source, room_id, device_id, command_json, status, message
+            FROM command_audit
+            WHERE (?1 IS NULL OR device_id = ?1)
+              AND (?2 IS NULL OR recorded_at >= ?2)
+              AND (?3 IS NULL OR recorded_at <= ?3)
+            ORDER BY recorded_at DESC, id DESC
+            LIMIT ?4
+            "#,
+        )
+        .bind(device_id.map(|value| value.0.as_str()))
+        .bind(start.map(|value| value.to_rfc3339()))
+        .bind(end.map(|value| value.to_rfc3339()))
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load command audit from SQLite")?;
+
+        rows.into_iter().map(command_audit_from_row).collect()
+    }
+
+    async fn save_scene_execution(&self, entry: &SceneExecutionHistoryEntry) -> Result<()> {
+        let results_json = serde_json::to_string(&entry.results)
+            .context("failed to serialize scene execution history entry")?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO scene_execution_history (executed_at, scene_id, status, error, results_json)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+        )
+        .bind(entry.executed_at.to_rfc3339())
+        .bind(&entry.scene_id)
+        .bind(&entry.status)
+        .bind(&entry.error)
+        .bind(results_json)
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("failed to save scene execution history for '{}'", entry.scene_id))?;
+
+        Ok(())
+    }
+
+    async fn load_scene_history(
+        &self,
+        scene_id: &str,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<Vec<SceneExecutionHistoryEntry>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT executed_at, scene_id, status, error, results_json
+            FROM scene_execution_history
+            WHERE scene_id = ?1
+              AND (?2 IS NULL OR executed_at >= ?2)
+              AND (?3 IS NULL OR executed_at <= ?3)
+            ORDER BY executed_at DESC, id DESC
+            LIMIT ?4
+            "#,
+        )
+        .bind(scene_id)
+        .bind(start.map(|value| value.to_rfc3339()))
+        .bind(end.map(|value| value.to_rfc3339()))
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("failed to load scene history for '{scene_id}'"))?;
+
+        rows.into_iter().map(scene_history_from_row).collect()
+    }
 }
 
 fn sqlite_connect_options(database_url: &str, auto_create: bool) -> Result<SqliteConnectOptions> {
@@ -564,6 +725,40 @@ fn attribute_history_from_row(row: sqlx::sqlite::SqliteRow) -> Result<AttributeH
     })
 }
 
+fn command_audit_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CommandAuditEntry> {
+    let recorded_at = DateTime::parse_from_rfc3339(&row.get::<String, _>("recorded_at"))
+        .context("invalid command audit recorded_at")?
+        .with_timezone(&Utc);
+    let command = serde_json::from_str(&row.get::<String, _>("command_json"))
+        .context("invalid command audit JSON")?;
+
+    Ok(CommandAuditEntry {
+        recorded_at,
+        source: row.get::<String, _>("source"),
+        room_id: row.get::<Option<String>, _>("room_id").map(RoomId),
+        device_id: DeviceId(row.get::<String, _>("device_id")),
+        command,
+        status: row.get::<String, _>("status"),
+        message: row.get::<Option<String>, _>("message"),
+    })
+}
+
+fn scene_history_from_row(row: sqlx::sqlite::SqliteRow) -> Result<SceneExecutionHistoryEntry> {
+    let executed_at = DateTime::parse_from_rfc3339(&row.get::<String, _>("executed_at"))
+        .context("invalid scene execution history executed_at")?
+        .with_timezone(&Utc);
+    let results = serde_json::from_str(&row.get::<String, _>("results_json"))
+        .context("invalid scene execution history JSON")?;
+
+    Ok(SceneExecutionHistoryEntry {
+        executed_at,
+        scene_id: row.get::<String, _>("scene_id"),
+        status: row.get::<String, _>("status"),
+        error: row.get::<Option<String>, _>("error"),
+        results,
+    })
+}
+
 fn room_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Room> {
     Ok(Room {
         id: RoomId(row.get::<String, _>("id")),
@@ -598,6 +793,7 @@ mod tests {
     use chrono::Duration as ChronoDuration;
     use smart_home_core::capability::{measurement_value, TEMPERATURE_OUTDOOR};
     use smart_home_core::model::{AttributeValue, DeviceKind};
+    use smart_home_core::store::SceneStepResult;
 
     use super::*;
 
@@ -878,5 +1074,63 @@ mod tests {
             .expect("device history loads");
         assert_eq!(device_history.len(), 1);
         assert_eq!(device_history[0].observed_at, fresh.updated_at);
+    }
+
+    #[tokio::test]
+    async fn saves_and_loads_command_audit_history() {
+        let store = temp_store().await;
+        let recorded_at = Utc::now();
+        let entry = CommandAuditEntry {
+            recorded_at,
+            source: "device".to_string(),
+            room_id: Some(RoomId("lab".to_string())),
+            device_id: DeviceId("test:one".to_string()),
+            command: smart_home_core::command::DeviceCommand {
+                capability: "brightness".to_string(),
+                action: "set".to_string(),
+                value: Some(AttributeValue::Integer(42)),
+            },
+            status: "ok".to_string(),
+            message: None,
+        };
+
+        store
+            .save_command_audit(&entry)
+            .await
+            .expect("save command audit succeeds");
+
+        let entries = store
+            .load_command_audit(Some(&entry.device_id), None, None, 10)
+            .await
+            .expect("load command audit succeeds");
+        assert_eq!(entries, vec![entry]);
+    }
+
+    #[tokio::test]
+    async fn saves_and_loads_scene_execution_history() {
+        let store = temp_store().await;
+        let executed_at = Utc::now();
+        let entry = SceneExecutionHistoryEntry {
+            executed_at,
+            scene_id: "movie_time".to_string(),
+            status: "ok".to_string(),
+            error: None,
+            results: vec![SceneStepResult {
+                target: "test:one".to_string(),
+                status: "ok".to_string(),
+                message: None,
+            }],
+        };
+
+        store
+            .save_scene_execution(&entry)
+            .await
+            .expect("save scene history succeeds");
+
+        let entries = store
+            .load_scene_history("movie_time", None, None, 10)
+            .await
+            .expect("load scene history succeeds");
+        assert_eq!(entries, vec![entry]);
     }
 }

@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::command::DeviceCommand;
 use crate::model::{AttributeValue, Device, DeviceId, Room, RoomId};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -15,6 +16,33 @@ pub struct AttributeHistoryEntry {
     pub device_id: DeviceId,
     pub attribute: String,
     pub value: AttributeValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommandAuditEntry {
+    pub recorded_at: DateTime<Utc>,
+    pub source: String,
+    pub room_id: Option<RoomId>,
+    pub device_id: DeviceId,
+    pub command: DeviceCommand,
+    pub status: String,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SceneStepResult {
+    pub target: String,
+    pub status: String,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SceneExecutionHistoryEntry {
+    pub executed_at: DateTime<Utc>,
+    pub scene_id: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub results: Vec<SceneStepResult>,
 }
 
 #[async_trait::async_trait]
@@ -40,4 +68,20 @@ pub trait DeviceStore: Send + Sync + 'static {
         end: Option<DateTime<Utc>>,
         limit: usize,
     ) -> anyhow::Result<Vec<AttributeHistoryEntry>>;
+    async fn save_command_audit(&self, entry: &CommandAuditEntry) -> anyhow::Result<()>;
+    async fn load_command_audit(
+        &self,
+        device_id: Option<&DeviceId>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<CommandAuditEntry>>;
+    async fn save_scene_execution(&self, entry: &SceneExecutionHistoryEntry) -> anyhow::Result<()>;
+    async fn load_scene_history(
+        &self,
+        scene_id: &str,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<SceneExecutionHistoryEntry>>;
 }
