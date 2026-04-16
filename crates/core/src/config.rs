@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -9,8 +10,16 @@ use crate::runtime::RuntimeConfig;
 pub struct Config {
     pub runtime: RuntimeConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub persistence: PersistenceConfig,
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
+    #[serde(default)]
     pub adapters: AdaptersConfig,
 }
+
+pub type AdapterConfig = serde_json::Value;
+pub type AdaptersConfig = HashMap<String, AdapterConfig>;
 
 #[derive(Debug, Deserialize)]
 pub struct LoggingConfig {
@@ -18,16 +27,46 @@ pub struct LoggingConfig {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct AdaptersConfig {
-    pub open_meteo: OpenMeteoConfig,
+pub struct PersistenceConfig {
+    pub enabled: bool,
+    pub backend: PersistenceBackend,
+    pub database_url: Option<String>,
+    pub auto_create: bool,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct OpenMeteoConfig {
+impl Default for PersistenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            backend: PersistenceBackend::Sqlite,
+            database_url: Some("sqlite://data/smart-home.db".to_string()),
+            auto_create: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistenceBackend {
+    Sqlite,
+    Postgres,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TelemetryConfig {
     pub enabled: bool,
-    pub latitude: f64,
-    pub longitude: f64,
-    pub poll_interval_secs: u64,
+    #[serde(default)]
+    pub selection: TelemetrySelectionConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TelemetrySelectionConfig {
+    #[serde(default)]
+    pub device_ids: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub adapter_names: Vec<String>,
 }
 
 impl Config {
@@ -51,8 +90,16 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.adapters.open_meteo.poll_interval_secs < 60 {
-            bail!("adapters.open_meteo.poll_interval_secs must be >= 60");
+        if self.persistence.enabled
+            && self
+                .persistence
+                .database_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+        {
+            bail!("persistence.database_url is required when persistence is enabled");
         }
 
         Ok(())

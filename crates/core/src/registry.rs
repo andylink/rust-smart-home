@@ -23,7 +23,7 @@ impl DeviceRegistry {
     }
 
     pub async fn upsert(&self, device: Device) -> Result<()> {
-        validate_attributes(&device)?;
+        validate_device(&device)?;
 
         let event = {
             let mut devices = write_guard(&self.devices);
@@ -41,6 +41,20 @@ impl DeviceRegistry {
         };
 
         self.bus.publish(event);
+        Ok(())
+    }
+
+    pub fn restore(&self, devices: Vec<Device>) -> Result<()> {
+        let mut restored = HashMap::with_capacity(devices.len());
+
+        for device in devices {
+            validate_device(&device)?;
+            restored.insert(device.id.clone(), device);
+        }
+
+        let mut current = write_guard(&self.devices);
+        *current = restored;
+
         Ok(())
     }
 
@@ -77,6 +91,10 @@ fn validate_attributes(device: &Device) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn validate_device(device: &Device) -> Result<()> {
+    validate_attributes(device)
 }
 
 fn validate_capability_value(schema: CapabilitySchema, value: &AttributeValue) -> std::result::Result<(), &'static str> {

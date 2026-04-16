@@ -6,10 +6,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 use reqwest::Client;
 use serde::Deserialize;
-use smart_home_core::adapter::Adapter;
+use smart_home_core::adapter::{Adapter, AdapterFactory, RegisteredAdapterFactory};
 use smart_home_core::bus::EventBus;
 use smart_home_core::capability::{TEMPERATURE_OUTDOOR, WIND_DIRECTION, WIND_SPEED, measurement_value};
-use smart_home_core::config::OpenMeteoConfig;
+use smart_home_core::config::AdapterConfig;
 use smart_home_core::event::Event;
 use smart_home_core::model::{AttributeValue, Attributes, Device, DeviceId, DeviceKind, Metadata};
 use smart_home_core::registry::DeviceRegistry;
@@ -17,6 +17,28 @@ use tokio::time::{sleep, Duration};
 
 const ADAPTER_NAME: &str = "open_meteo";
 const DEFAULT_BASE_URL: &str = "https://api.open-meteo.com";
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenMeteoConfig {
+    pub enabled: bool,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub poll_interval_secs: u64,
+    #[serde(default = "default_base_url")]
+    pub base_url: String,
+    #[serde(default)]
+    pub test_poll_interval_ms: Option<u64>,
+}
+
+pub struct OpenMeteoFactory;
+
+static OPEN_METEO_FACTORY: OpenMeteoFactory = OpenMeteoFactory;
+
+inventory::submit! {
+    RegisteredAdapterFactory {
+        factory: &OPEN_METEO_FACTORY,
+    }
+}
 
 pub struct OpenMeteoAdapter {
     client: Client,
@@ -28,7 +50,10 @@ pub struct OpenMeteoAdapter {
 
 impl OpenMeteoAdapter {
     pub fn new(config: OpenMeteoConfig) -> Self {
-        Self::with_options(config, DEFAULT_BASE_URL, None)
+        let poll_interval = config.test_poll_interval_ms.map(Duration::from_millis);
+        let base_url = config.base_url.clone();
+
+        Self::with_options(config, base_url, poll_interval)
     }
 
     pub fn with_base_url(config: OpenMeteoConfig, base_url: impl Into<String>) -> Self {
@@ -140,6 +165,24 @@ impl OpenMeteoAdapter {
     }
 }
 
+impl AdapterFactory for OpenMeteoFactory {
+    fn name(&self) -> &'static str {
+        ADAPTER_NAME
+    }
+
+    fn build(&self, config: AdapterConfig) -> Result<Option<Box<dyn Adapter>>> {
+        let config: OpenMeteoConfig = serde_json::from_value(config)
+            .context("failed to parse open_meteo adapter config")?;
+        validate_config(&config)?;
+
+        if !config.enabled {
+            return Ok(None);
+        }
+
+        Ok(Some(Box::new(OpenMeteoAdapter::new(config))))
+    }
+}
+
 #[async_trait]
 impl Adapter for OpenMeteoAdapter {
     fn name(&self) -> &str {
@@ -196,6 +239,18 @@ fn build_device(vendor_id: &str, attributes: Attributes, updated_at: chrono::Dat
         },
         updated_at,
     }
+}
+
+fn validate_config(config: &OpenMeteoConfig) -> Result<()> {
+    if config.poll_interval_secs < 60 {
+        anyhow::bail!("adapters.open_meteo.poll_interval_secs must be >= 60");
+    }
+
+    Ok(())
+}
+
+fn default_base_url() -> String {
+    DEFAULT_BASE_URL.to_string()
 }
 
 #[cfg(test)]
@@ -297,6 +352,8 @@ mod tests {
             latitude: 51.5,
             longitude: -0.1,
             poll_interval_secs: 60,
+            base_url: DEFAULT_BASE_URL.to_string(),
+            test_poll_interval_ms: None,
         }
     }
 
@@ -399,5 +456,37 @@ mod tests {
         let _ = adapter_task.await;
 
         Ok(())
+    }
+
+    #[test]
+    fn factory_returns_none_when_disabled() {
+        let adapter = OPEN_METEO_FACTORY
+            .build(serde_json::json!({
+                "enabled": false,
+                "latitude": 51.5,
+                "longitude": -0.1,
+                "poll_interval_secs": 90
+            }))
+            .expect("factory should parse disabled config");
+
+        assert!(adapter.is_none());
+    }
+
+    #[test]
+    fn factory_rejects_invalid_poll_interval() {
+        let error = OPEN_METEO_FACTORY
+            .build(serde_json::json!({
+                "enabled": true,
+                "latitude": 51.5,
+                "longitude": -0.1,
+                "poll_interval_secs": 59
+            }))
+            .err()
+            .expect("factory should reject invalid poll interval");
+
+        assert_eq!(
+            error.to_string(),
+            "adapters.open_meteo.poll_interval_secs must be >= 60"
+        );
     }
 }

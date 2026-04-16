@@ -329,6 +329,38 @@ async fn concurrent_upserts_produce_expected_registry_size() {
     assert_eq!(registry.list().len(), 10);
 }
 
+#[tokio::test]
+async fn restore_loads_devices_without_publishing_events() {
+    let bus = EventBus::new(16);
+    let registry = DeviceRegistry::new(bus.clone());
+    let mut subscriber = bus.subscribe();
+    let restored = vec![sample_device(
+        "test:restored",
+        TEMPERATURE_OUTDOOR,
+        measurement_value(23.0, "celsius"),
+    )];
+
+    registry.restore(restored.clone()).expect("restore succeeds");
+
+    assert_eq!(registry.list(), restored);
+    assert!(matches!(subscriber.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
+}
+
+#[tokio::test]
+async fn restore_rejects_invalid_device_shape() {
+    let bus = EventBus::new(16);
+    let registry = DeviceRegistry::new(bus);
+    let invalid = sample_device(
+        "test:restored-invalid",
+        TEMPERATURE_OUTDOOR,
+        AttributeValue::Text("bad".to_string()),
+    );
+
+    let error = registry.restore(vec![invalid]).expect_err("invalid restore should fail");
+
+    assert!(error.to_string().contains("expected measurement object"));
+}
+
 #[test]
 fn mock_adapter_implements_trait() {
     fn assert_adapter<T: Adapter>(_adapter: &T) {}
@@ -489,10 +521,23 @@ fn config_loads_default_toml() {
 
     assert_eq!(config.runtime.event_bus_capacity, 1024);
     assert_eq!(config.logging.level, "info");
-    assert!(config.adapters.open_meteo.enabled);
-    assert_eq!(config.adapters.open_meteo.latitude, 51.5);
-    assert_eq!(config.adapters.open_meteo.longitude, -0.1);
-    assert_eq!(config.adapters.open_meteo.poll_interval_secs, 300);
+    assert!(config.persistence.enabled);
+    assert_eq!(config.persistence.backend, crate::config::PersistenceBackend::Sqlite);
+    assert_eq!(
+        config.persistence.database_url.as_deref(),
+        Some("sqlite://data/smart-home.db")
+    );
+    assert!(config.persistence.auto_create);
+    assert!(!config.telemetry.enabled);
+    assert!(config.telemetry.selection.device_ids.is_empty());
+    let open_meteo = config
+        .adapters
+        .get("open_meteo")
+        .expect("open_meteo adapter config exists");
+    assert_eq!(open_meteo["enabled"], serde_json::json!(true));
+    assert_eq!(open_meteo["latitude"], serde_json::json!(51.5));
+    assert_eq!(open_meteo["longitude"], serde_json::json!(-0.1));
+    assert_eq!(open_meteo["poll_interval_secs"], serde_json::json!(90));
 }
 
 #[test]
@@ -512,14 +557,21 @@ longitude = -0.1
 "#,
     );
 
-    let error = Config::load_from_file(&path).expect_err("missing field should fail");
+    let config = Config::load_from_file(&path).expect("generic adapter config should load");
     let _ = fs::remove_file(&path);
 
-    assert!(error.to_string().contains("poll_interval_secs"));
+    let open_meteo = config
+        .adapters
+        .get("open_meteo")
+        .expect("open_meteo adapter config exists");
+    assert_eq!(open_meteo["enabled"], serde_json::json!(true));
+    assert_eq!(open_meteo["latitude"], serde_json::json!(51.5));
+    assert_eq!(open_meteo["longitude"], serde_json::json!(-0.1));
+    assert!(open_meteo.get("poll_interval_secs").is_none());
 }
 
 #[test]
-fn config_rejects_poll_interval_below_minimum() {
+fn config_rejects_missing_database_url_when_persistence_enabled() {
     let path = write_temp_config(
         r#"
 [runtime]
@@ -528,19 +580,24 @@ event_bus_capacity = 1024
 [logging]
 level = "info"
 
+[persistence]
+enabled = true
+backend = "sqlite"
+auto_create = true
+
 [adapters.open_meteo]
 enabled = true
 latitude = 51.5
 longitude = -0.1
-poll_interval_secs = 59
+poll_interval_secs = 90
 "#,
     );
 
-    let error = Config::load_from_file(&path).expect_err("invalid poll interval should fail");
+    let error = Config::load_from_file(&path).expect_err("missing database url should fail");
     let _ = fs::remove_file(&path);
 
     assert_eq!(
         error.to_string(),
-        "adapters.open_meteo.poll_interval_secs must be >= 60"
+        "persistence.database_url is required when persistence is enabled"
     );
 }

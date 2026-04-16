@@ -4,6 +4,20 @@ event_bus_capacity = 1024
 [logging]
 level = "info"
 
+[persistence]
+enabled = true
+backend = "sqlite"
+database_url = "sqlite://data/smart-home.db"
+auto_create = true
+
+[telemetry]
+enabled = false
+
+[telemetry.selection]
+device_ids = []
+capabilities = []
+adapter_names = []
+
 [adapters.open_meteo]
 enabled = true
 latitude = 51.5

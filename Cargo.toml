@@ -1,7 +1,9 @@
 [workspace]
 members = [
     "crates/core",
+    "crates/adapters",
     "crates/api",
     "crates/adapter-open-meteo",
+    "crates/store-sql",
 ]
 resolver = "2"

@@ -6,6 +6,7 @@ pub mod event;
 pub mod model;
 pub mod registry;
 pub mod runtime;
+pub mod store;
 
 #[cfg(test)]
 mod tests;
