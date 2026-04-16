@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use axum::extract::Query;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::Path;
 use axum::extract::State;
@@ -22,9 +24,9 @@ use smart_home_core::config::{Config, PersistenceBackend};
 use smart_home_core::event::Event;
 use smart_home_core::model::{DeviceId, Room, RoomId};
 use smart_home_core::runtime::Runtime;
-use smart_home_core::store::DeviceStore;
+use smart_home_core::store::{AttributeHistoryEntry, DeviceHistoryEntry, DeviceStore};
 use smart_home_scenes::{SceneCatalog, SceneExecutionResult, SceneSummary};
-use store_sql::SqliteDeviceStore;
+use store_sql::{SqliteDeviceStore, SqliteHistoryConfig};
 use tracing::Level;
 
 #[derive(Clone, Serialize)]
@@ -80,6 +82,15 @@ struct AppState {
     runtime: Arc<Runtime>,
     scenes: Arc<SceneCatalog>,
     health: HealthState,
+    store: Option<Arc<dyn DeviceStore>>,
+    history: HistorySettings,
+}
+
+#[derive(Clone)]
+struct HistorySettings {
+    enabled: bool,
+    default_limit: usize,
+    max_limit: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -108,6 +119,26 @@ struct HealthSnapshot {
 struct ApiError {
     status: StatusCode,
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceHistoryResponse {
+    device_id: String,
+    entries: Vec<DeviceHistoryEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct AttributeHistoryResponse {
+    device_id: String,
+    attribute: String,
+    entries: Vec<AttributeHistoryEntry>,
 }
 
 impl ComponentStatus {
@@ -260,6 +291,37 @@ impl HealthState {
     }
 }
 
+impl HistorySettings {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            enabled: config.persistence.enabled && config.persistence.history.enabled,
+            default_limit: config.persistence.history.default_query_limit,
+            max_limit: config.persistence.history.max_query_limit,
+        }
+    }
+
+    fn resolve_limit(&self, requested: Option<usize>) -> Result<usize, ApiError> {
+        let limit = requested.unwrap_or(self.default_limit);
+        if limit == 0 {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "history query limit must be greater than zero",
+            ));
+        }
+        if limit > self.max_limit {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "history query limit must be <= {}",
+                    self.max_limit
+                ),
+            ));
+        }
+
+        Ok(limit)
+    }
+}
+
 impl ApiError {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
@@ -353,6 +415,8 @@ async fn main() -> Result<()> {
             runtime: runtime.clone(),
             scenes,
             health: health.clone(),
+            store: device_store.clone(),
+            history: HistorySettings::from_config(&config),
         },
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
@@ -458,9 +522,20 @@ async fn create_device_store(config: &Config) -> Result<Option<Arc<dyn DeviceSto
 
     let store: Arc<dyn DeviceStore> = match config.persistence.backend {
         PersistenceBackend::Sqlite => Arc::new(
-            SqliteDeviceStore::new(database_url, config.persistence.auto_create)
-                .await
-                .with_context(|| format!("failed to initialize SQLite store '{database_url}'"))?,
+            SqliteDeviceStore::new_with_history(
+                database_url,
+                config.persistence.auto_create,
+                SqliteHistoryConfig {
+                    enabled: config.persistence.history.enabled,
+                    retention: config
+                        .persistence
+                        .history
+                        .retention_days
+                        .map(|days| Duration::from_secs(days.saturating_mul(24 * 60 * 60))),
+                },
+            )
+            .await
+            .with_context(|| format!("failed to initialize SQLite store '{database_url}'"))?,
         ),
         PersistenceBackend::Postgres => {
             anyhow::bail!("persistence backend 'postgres' is not implemented yet")
@@ -728,6 +803,11 @@ fn app(state: AppState) -> Router {
         .route("/rooms/{id}/command", post(command_room_devices))
         .route("/devices", get(list_devices))
         .route("/devices/{id}", get(get_device))
+        .route("/devices/{id}/history", get(get_device_history))
+        .route(
+            "/devices/{id}/history/{attribute}",
+            get(get_attribute_history),
+        )
         .route("/devices/{id}/room", post(assign_device_room))
         .route("/devices/{id}/command", post(command_device))
         .route("/events", get(events))
@@ -849,6 +929,51 @@ async fn get_device(
         .ok_or_else(|| ApiError::not_found(format!("device '{id}' not found")))
 }
 
+async fn get_device_history(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<DeviceHistoryResponse>, ApiError> {
+    let device_id = DeviceId(id.clone());
+    let store = history_store(&state)?;
+    ensure_history_query_range(&query)?;
+    ensure_device_exists(&state, &device_id, &id)?;
+    let limit = state.history.resolve_limit(query.limit)?;
+
+    let entries = store
+        .load_device_history(&device_id, query.start, query.end, limit)
+        .await
+        .map_err(internal_api_error)?;
+
+    Ok(Json(DeviceHistoryResponse {
+        device_id: id,
+        entries,
+    }))
+}
+
+async fn get_attribute_history(
+    State(state): State<AppState>,
+    Path((id, attribute)): Path<(String, String)>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<AttributeHistoryResponse>, ApiError> {
+    let device_id = DeviceId(id.clone());
+    let store = history_store(&state)?;
+    ensure_history_query_range(&query)?;
+    ensure_device_exists(&state, &device_id, &id)?;
+    let limit = state.history.resolve_limit(query.limit)?;
+
+    let entries = store
+        .load_attribute_history(&device_id, &attribute, query.start, query.end, limit)
+        .await
+        .map_err(internal_api_error)?;
+
+    Ok(Json(AttributeHistoryResponse {
+        device_id: id,
+        attribute,
+        entries,
+    }))
+}
+
 async fn assign_device_room(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -949,6 +1074,48 @@ async fn events(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl Int
     ws.on_upgrade(move |socket| handle_events_socket(socket, state.runtime))
 }
 
+fn history_store(state: &AppState) -> Result<Arc<dyn DeviceStore>, ApiError> {
+    if !state.history.enabled {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "history is disabled",
+        ));
+    }
+
+    state.store.clone().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "history is unavailable because persistence is disabled",
+        )
+    })
+}
+
+fn ensure_history_query_range(query: &HistoryQuery) -> Result<(), ApiError> {
+    if let (Some(start), Some(end)) = (query.start, query.end) {
+        if start > end {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "history query start must be <= end",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_device_exists(state: &AppState, device_id: &DeviceId, raw_id: &str) -> Result<(), ApiError> {
+    if state.runtime.registry().get(device_id).is_none() {
+        return Err(ApiError::not_found(format!("device '{raw_id}' not found")));
+    }
+
+    Ok(())
+}
+
+fn internal_api_error(error: anyhow::Error) -> ApiError {
+    tracing::error!(error = %error, "internal API error");
+    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+}
+
 async fn handle_events_socket(mut socket: WebSocket, runtime: Arc<Runtime>) {
     let mut receiver = runtime.bus().subscribe();
 
@@ -1043,13 +1210,13 @@ mod tests {
     use serde_json::Value;
     use smart_home_core::capability::{measurement_value, TEMPERATURE_OUTDOOR};
     use smart_home_core::command::DeviceCommand;
-    use smart_home_core::config::{Config, PersistenceBackend};
+    use smart_home_core::config::{Config, HistoryConfig, PersistenceBackend};
     use smart_home_core::model::{
         AttributeValue, Device, DeviceId, DeviceKind, Metadata, Room, RoomId,
     };
     use smart_home_core::runtime::RuntimeConfig;
     use smart_home_scenes::SceneCatalog;
-    use store_sql::SqliteDeviceStore;
+    use store_sql::{SqliteDeviceStore, SqliteHistoryConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::{oneshot, Notify};
@@ -1069,6 +1236,8 @@ mod tests {
     struct LaggyMemoryStore {
         devices: Mutex<HashMap<DeviceId, Device>>,
         rooms: Mutex<HashMap<RoomId, Room>>,
+        device_history: Mutex<HashMap<DeviceId, Vec<DeviceHistoryEntry>>>,
+        attribute_history: Mutex<HashMap<(DeviceId, String), Vec<AttributeHistoryEntry>>>,
         first_save_started: Notify,
         first_save_seen: Mutex<bool>,
         delay_first_save: Mutex<bool>,
@@ -1079,6 +1248,8 @@ mod tests {
             Self {
                 devices: Mutex::new(HashMap::new()),
                 rooms: Mutex::new(HashMap::new()),
+                device_history: Mutex::new(HashMap::new()),
+                attribute_history: Mutex::new(HashMap::new()),
                 first_save_started: Notify::new(),
                 first_save_seen: Mutex::new(false),
                 delay_first_save: Mutex::new(true),
@@ -1142,6 +1313,33 @@ mod tests {
                 .lock()
                 .expect("devices lock")
                 .insert(device.id.clone(), device.clone());
+
+            self.device_history
+                .lock()
+                .expect("device history lock")
+                .entry(device.id.clone())
+                .or_default()
+                .push(DeviceHistoryEntry {
+                    observed_at: device.updated_at,
+                    device: device.clone(),
+                });
+
+            let mut attribute_history = self
+                .attribute_history
+                .lock()
+                .expect("attribute history lock");
+            for (attribute, value) in &device.attributes {
+                attribute_history
+                    .entry((device.id.clone(), attribute.clone()))
+                    .or_default()
+                    .push(AttributeHistoryEntry {
+                        observed_at: device.updated_at,
+                        device_id: device.id.clone(),
+                        attribute: attribute.clone(),
+                        value: value.clone(),
+                    });
+            }
+
             Ok(())
         }
 
@@ -1161,6 +1359,53 @@ mod tests {
         async fn delete_room(&self, id: &RoomId) -> anyhow::Result<()> {
             self.rooms.lock().expect("rooms lock").remove(id);
             Ok(())
+        }
+
+        async fn load_device_history(
+            &self,
+            id: &DeviceId,
+            start: Option<DateTime<Utc>>,
+            end: Option<DateTime<Utc>>,
+            limit: usize,
+        ) -> anyhow::Result<Vec<DeviceHistoryEntry>> {
+            let entries = self
+                .device_history
+                .lock()
+                .expect("device history lock")
+                .get(id)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|entry| start.map(|value| entry.observed_at >= value).unwrap_or(true))
+                .filter(|entry| end.map(|value| entry.observed_at <= value).unwrap_or(true))
+                .rev()
+                .take(limit)
+                .collect();
+            Ok(entries)
+        }
+
+        async fn load_attribute_history(
+            &self,
+            id: &DeviceId,
+            attribute: &str,
+            start: Option<DateTime<Utc>>,
+            end: Option<DateTime<Utc>>,
+            limit: usize,
+        ) -> anyhow::Result<Vec<AttributeHistoryEntry>> {
+            let entries = self
+                .attribute_history
+                .lock()
+                .expect("attribute history lock")
+                .get(&(id.clone(), attribute.to_string()))
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|entry| start.map(|value| entry.observed_at >= value).unwrap_or(true))
+                .filter(|entry| end.map(|value| entry.observed_at <= value).unwrap_or(true))
+                .rev()
+                .take(limit)
+                .collect();
+            Ok(entries)
         }
     }
 
@@ -1317,6 +1562,7 @@ mod tests {
                 backend: PersistenceBackend::Sqlite,
                 database_url: Some(temp_sqlite_url()),
                 auto_create: true,
+                history: HistoryConfig::default(),
             },
             scenes: smart_home_core::config::ScenesConfig::default(),
             automations: smart_home_core::config::AutomationsConfig::default(),
@@ -1328,6 +1574,14 @@ mod tests {
 
     fn empty_scenes() -> Arc<SceneCatalog> {
         Arc::new(SceneCatalog::empty())
+    }
+
+    fn history_settings(enabled: bool) -> HistorySettings {
+        HistorySettings {
+            enabled,
+            default_limit: 200,
+            max_limit: 1000,
+        }
     }
 
     fn test_health(adapter_names: &[&str]) -> HealthState {
@@ -1392,6 +1646,8 @@ mod tests {
             runtime,
             scenes: empty_scenes(),
             health: test_health(&["open_meteo"]),
+            store: None,
+            history: history_settings(false),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1419,6 +1675,38 @@ mod tests {
             runtime,
             scenes,
             health: test_health(&["open_meteo"]),
+            store: None,
+            history: history_settings(false),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("read test listener address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("test server exits cleanly");
+        });
+
+        (addr, shutdown_tx, handle)
+    }
+
+    async fn spawn_test_server_with_store(
+        runtime: Arc<Runtime>,
+        store: Arc<dyn DeviceStore>,
+        history_enabled: bool,
+    ) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        let app = app(AppState {
+            runtime,
+            scenes: empty_scenes(),
+            health: test_health(&["open_meteo"]),
+            store: Some(store),
+            history: history_settings(history_enabled),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1825,6 +2113,190 @@ mod tests {
         let body = response.json::<Value>().await.expect("devices JSON body");
         assert_eq!(body.as_array().expect("devices array").len(), 1);
         assert_eq!(body[0]["id"], Value::String("test:hydrated".to_string()));
+
+        let _ = shutdown.send(());
+        handle.await.expect("server task completes");
+    }
+
+    #[tokio::test]
+    async fn device_history_endpoint_returns_timeline_entries() {
+        let database_url = temp_sqlite_url();
+        let store = Arc::new(
+            SqliteDeviceStore::new_with_history(
+                &database_url,
+                true,
+                SqliteHistoryConfig {
+                    enabled: true,
+                    retention: None,
+                },
+            )
+            .await
+            .expect("sqlite store initializes"),
+        );
+        store
+            .save_room(&Room {
+                id: RoomId("lab".to_string()),
+                name: "Lab".to_string(),
+            })
+            .await
+            .expect("save room succeeds");
+        let first_at = Utc::now() - chrono::Duration::minutes(2);
+        let second_at = Utc::now() - chrono::Duration::minutes(1);
+        let mut first = sample_device(
+            "test:history",
+            TEMPERATURE_OUTDOOR,
+            measurement_value(20.0, "celsius"),
+        );
+        first.room_id = Some(RoomId("lab".to_string()));
+        first.updated_at = first_at;
+        first.last_seen = first_at;
+        let mut second = first.clone();
+        second.updated_at = second_at;
+        second.last_seen = second_at;
+        second.attributes.insert(
+            TEMPERATURE_OUTDOOR.to_string(),
+            measurement_value(21.5, "celsius"),
+        );
+        store.save_device(&first).await.expect("first save succeeds");
+        store.save_device(&second).await.expect("second save succeeds");
+
+        let runtime = Arc::new(Runtime::new(
+            Vec::new(),
+            RuntimeConfig {
+                event_bus_capacity: 16,
+            },
+        ));
+        runtime.registry().restore_rooms(vec![Room {
+            id: RoomId("lab".to_string()),
+            name: "Lab".to_string(),
+        }]);
+        runtime
+            .registry()
+            .restore(vec![second.clone()])
+            .expect("restore succeeds");
+
+        let (addr, shutdown, handle) =
+            spawn_test_server_with_store(runtime, store, true).await;
+
+        let response = reqwest::get(format!(
+            "http://{addr}/devices/test:history/history?limit=1"
+        ))
+        .await
+        .expect("history request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.json::<Value>().await.expect("history json body");
+        assert_eq!(body["device_id"], "test:history");
+        assert_eq!(body["entries"].as_array().expect("entries array").len(), 1);
+        assert_eq!(body["entries"][0]["device"]["attributes"][TEMPERATURE_OUTDOOR]["value"], 21.5);
+
+        let _ = shutdown.send(());
+        handle.await.expect("server task completes");
+    }
+
+    #[tokio::test]
+    async fn attribute_history_endpoint_filters_by_time_range() {
+        let database_url = temp_sqlite_url();
+        let store = Arc::new(
+            SqliteDeviceStore::new_with_history(
+                &database_url,
+                true,
+                SqliteHistoryConfig {
+                    enabled: true,
+                    retention: None,
+                },
+            )
+            .await
+            .expect("sqlite store initializes"),
+        );
+        let first_at = Utc::now() - chrono::Duration::minutes(3);
+        let second_at = Utc::now() - chrono::Duration::minutes(1);
+        let mut first = sample_device(
+            "test:history",
+            TEMPERATURE_OUTDOOR,
+            measurement_value(20.0, "celsius"),
+        );
+        first.updated_at = first_at;
+        first.last_seen = first_at;
+        let mut second = first.clone();
+        second.updated_at = second_at;
+        second.last_seen = second_at;
+        second.attributes.insert(
+            TEMPERATURE_OUTDOOR.to_string(),
+            measurement_value(22.0, "celsius"),
+        );
+        store.save_device(&first).await.expect("first save succeeds");
+        store.save_device(&second).await.expect("second save succeeds");
+
+        let runtime = Arc::new(Runtime::new(
+            Vec::new(),
+            RuntimeConfig {
+                event_bus_capacity: 16,
+            },
+        ));
+        runtime
+            .registry()
+            .restore(vec![second.clone()])
+            .expect("restore succeeds");
+
+        let (addr, shutdown, handle) =
+            spawn_test_server_with_store(runtime, store, true).await;
+
+        let response = reqwest::Client::new()
+            .get(format!(
+                "http://{addr}/devices/test:history/history/{TEMPERATURE_OUTDOOR}"
+            ))
+            .query(&[
+                (
+                    "start",
+                    (Utc::now() - chrono::Duration::minutes(2)).to_rfc3339(),
+                ),
+                ("end", Utc::now().to_rfc3339()),
+            ])
+            .send()
+            .await
+            .expect("attribute history request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .json::<Value>()
+            .await
+            .expect("attribute history json body");
+        assert_eq!(body["entries"].as_array().expect("entries array").len(), 1);
+        assert_eq!(body["entries"][0]["value"]["value"], 22.0);
+
+        let _ = shutdown.send(());
+        handle.await.expect("server task completes");
+    }
+
+    #[tokio::test]
+    async fn history_endpoints_return_not_found_when_disabled() {
+        let runtime = Arc::new(Runtime::new(
+            Vec::new(),
+            RuntimeConfig {
+                event_bus_capacity: 16,
+            },
+        ));
+        runtime
+            .registry()
+            .upsert(sample_device(
+                "test:device",
+                TEMPERATURE_OUTDOOR,
+                measurement_value(22.0, "celsius"),
+            ))
+            .await
+            .expect("valid test device upsert succeeds");
+        let (addr, shutdown, handle) = spawn_test_server(runtime).await;
+
+        let response = reqwest::get(format!("http://{addr}/devices/test:device/history"))
+            .await
+            .expect("history request succeeds");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.json::<Value>().await.expect("error json body")["error"],
+            "history is disabled"
+        );
 
         let _ = shutdown.send(());
         handle.await.expect("server task completes");
@@ -2384,6 +2856,7 @@ mod tests {
                 backend: PersistenceBackend::Postgres,
                 database_url: Some("postgres://localhost/smart-home".to_string()),
                 auto_create: true,
+                history: HistoryConfig::default(),
             },
             scenes: smart_home_core::config::ScenesConfig::default(),
             automations: smart_home_core::config::AutomationsConfig::default(),

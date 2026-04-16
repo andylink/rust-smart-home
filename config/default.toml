@@ -10,6 +10,12 @@ backend = "sqlite"
 database_url = "sqlite://data/smart-home.db"
 auto_create = true
 
+[persistence.history]
+enabled = true
+retention_days = 30
+default_query_limit = 200
+max_query_limit = 1000
+
 [scenes]
 enabled = true
 directory = "config/scenes"

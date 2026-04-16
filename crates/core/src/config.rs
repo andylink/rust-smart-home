@@ -38,6 +38,18 @@ pub struct PersistenceConfig {
     pub backend: PersistenceBackend,
     pub database_url: Option<String>,
     pub auto_create: bool,
+    #[serde(default)]
+    pub history: HistoryConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HistoryConfig {
+    pub enabled: bool,
+    pub retention_days: Option<u64>,
+    #[serde(default = "default_history_query_limit")]
+    pub default_query_limit: usize,
+    #[serde(default = "default_history_max_query_limit")]
+    pub max_query_limit: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +104,18 @@ impl Default for PersistenceConfig {
             backend: PersistenceBackend::Sqlite,
             database_url: Some("sqlite://data/smart-home.db".to_string()),
             auto_create: true,
+            history: HistoryConfig::default(),
+        }
+    }
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: None,
+            default_query_limit: default_history_query_limit(),
+            max_query_limit: default_history_max_query_limit(),
         }
     }
 }
@@ -165,6 +189,28 @@ impl Config {
             bail!("scripts.directory is required when scripts are enabled");
         }
 
+        if self.persistence.history.default_query_limit == 0 {
+            bail!("persistence.history.default_query_limit must be > 0");
+        }
+
+        if self.persistence.history.max_query_limit == 0 {
+            bail!("persistence.history.max_query_limit must be > 0");
+        }
+
+        if self.persistence.history.default_query_limit > self.persistence.history.max_query_limit {
+            bail!(
+                "persistence.history.default_query_limit must be <= persistence.history.max_query_limit"
+            );
+        }
+
         Ok(())
     }
+}
+
+fn default_history_query_limit() -> usize {
+    200
+}
+
+fn default_history_max_query_limit() -> usize {
+    1000
 }

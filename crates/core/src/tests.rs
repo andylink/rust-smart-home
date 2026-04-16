@@ -1067,6 +1067,10 @@ fn config_loads_default_toml() {
         Some("sqlite://data/smart-home.db")
     );
     assert!(config.persistence.auto_create);
+    assert!(config.persistence.history.enabled);
+    assert_eq!(config.persistence.history.retention_days, Some(30));
+    assert_eq!(config.persistence.history.default_query_limit, 200);
+    assert_eq!(config.persistence.history.max_query_limit, 1000);
     assert!(!config.telemetry.enabled);
     assert!(config.telemetry.selection.device_ids.is_empty());
     let open_meteo = config
