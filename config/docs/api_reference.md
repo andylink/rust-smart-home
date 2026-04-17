@@ -547,8 +547,6 @@ Current trigger types:
 
 - `device_state_change`
 - `weather_state`
-- `device_room_change`
-- `room_change`
 - `adapter_lifecycle`
 - `system_error`
 - `wall_clock`
@@ -605,17 +603,6 @@ return {
 - `debounce_secs` optional
 - `duration_secs` optional
 
-`device_room_change` fields:
-
-- `device_id` optional
-- `room_id` optional
-
-At least one of `device_id` or `room_id` is required.
-
-`room_change` fields:
-
-- `room_id` optional
-
 `adapter_lifecycle` fields:
 
 - `adapter` optional
@@ -641,6 +628,16 @@ At least one of `device_id` or `room_id` is required.
 `sunset` fields:
 
 - `offset_mins` optional, defaults to `0`
+
+Automations can also include an optional top-level `conditions` list with AND semantics.
+
+Supported condition types:
+
+- `device_state`
+- `presence`
+- `time_window`
+- `room_state`
+- `sun_position`
 
 Automations can also include an optional top-level `state` table:
 

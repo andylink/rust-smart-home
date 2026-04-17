@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 cron = "0.12"
 mlua = { version = "0.10", features = ["lua54", "vendored"] }
 sunrise = "1"

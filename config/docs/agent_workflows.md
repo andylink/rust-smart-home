@@ -115,8 +115,6 @@ Current automation trigger types:
 
 - `device_state_change`
 - `weather_state`
-- `device_room_change`
-- `room_change`
 - `adapter_lifecycle`
 - `system_error`
 - `wall_clock`

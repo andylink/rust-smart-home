@@ -264,6 +264,14 @@ Required fields:
 Optional fields:
 
 - `description`
+- `conditions`
+- `state`
+
+Execution model:
+
+- `trigger`: decides when the automation is considered
+- `conditions`: optional filters; all conditions must be true at trigger time
+- `execute`: Lua actions that run only after the trigger matched and every condition passed
 
 ### Trigger Types
 
@@ -271,8 +279,6 @@ Current first-pass trigger types:
 
 - `device_state_change`
 - `weather_state`
-- `device_room_change`
-- `room_change`
 - `adapter_lifecycle`
 - `system_error`
 - `wall_clock`
@@ -332,31 +338,6 @@ Behavior:
 - uses the same matching rules as `device_state_change`
 - intended for weather or other derived environmental devices where an automation wants a more explicit semantic trigger type
 
-#### `device_room_change`
-
-Fields:
-
-- `device_id` optional
-- `room_id` optional
-
-At least one of `device_id` or `room_id` must be provided.
-
-Behavior:
-
-- listens for `Event::DeviceRoomChanged`
-- can match a specific device, a specific destination room, or both
-
-#### `room_change`
-
-Fields:
-
-- `room_id` optional
-
-Behavior:
-
-- listens for `Event::RoomAdded`, `Event::RoomUpdated`, and `Event::RoomRemoved`
-- if `room_id` is set, only that room matches
-
 #### `adapter_lifecycle`
 
 Fields:
@@ -393,7 +374,7 @@ Fields:
 
 Behavior:
 
-- runs once per UTC day at the requested hour and minute
+- runs once per local day in `locale.timezone` at the requested hour and minute
 - event payload includes `type`, `scheduled_at`, `hour`, `minute`, and `timezone`
 
 Example:
@@ -449,12 +430,116 @@ Behavior:
 - schedules from the configured location in `adapters.open_meteo.latitude` and `adapters.open_meteo.longitude`
 - event payload includes `type`, `scheduled_at`, `offset_mins`, and `timezone`
 
+## Conditions
+
+Conditions are optional filters evaluated after the trigger matches and before `execute(ctx, event)` runs.
+
+All conditions use AND logic.
+
+Supported condition types:
+
+- `device_state`
+- `presence`
+- `time_window`
+- `room_state`
+- `sun_position`
+
+#### `device_state`
+
+Fields:
+
+- `device_id` required
+- `attribute` required
+- `equals` optional
+- `above` optional
+- `below` optional
+
+#### `presence`
+
+Fields:
+
+- `device_id` required
+- `attribute` optional, defaults to `presence`
+- `equals` optional, defaults to `true`
+
+#### `time_window`
+
+Fields:
+
+- `start` required in `HH:MM`
+- `end` required in `HH:MM`
+
+Behavior:
+
+- evaluated in `locale.timezone`
+- supports overnight ranges such as `22:00` to `06:00`
+
+#### `room_state`
+
+Fields:
+
+- `room_id` required
+- `min_devices` optional
+- `max_devices` optional
+
+#### `sun_position`
+
+Fields:
+
+- `after` optional, `sunrise` or `sunset`
+- `before` optional, `sunrise` or `sunset`
+- `after_offset_mins` optional
+- `before_offset_mins` optional
+
+Behavior:
+
+- uses configured latitude and longitude
+- useful for checks like "only after sunset"
+
+Example:
+
+```lua
+return {
+  id = "movie_mode",
+  name = "Movie Mode",
+  trigger = {
+    type = "device_state_change",
+    device_id = "remote:living_room",
+    attribute = "custom.remote.button",
+    equals = "movie",
+  },
+  conditions = {
+    {
+      type = "time_window",
+      start = "18:00",
+      end = "23:00",
+    },
+    {
+      type = "sun_position",
+      after = "sunset",
+    },
+    {
+      type = "device_state",
+      device_id = "roku_tv:tv",
+      attribute = "power",
+      equals = false,
+    },
+  },
+  execute = function(ctx, event)
+    ctx:command("elgato_lights:light:0", {
+      capability = "power",
+      action = "on",
+    })
+  end,
+}
+```
+
 ## Scheduling Notes
 
 Current scheduling behavior is intentionally simple:
 
-- scheduled automations use UTC
-- there is no configurable timezone yet
+- wall-clock conditions and wall-clock triggers use `locale.timezone`
+- cron scheduling remains UTC
 - resumable schedules can persist the last completed scheduled fire time per automation
 - missed runs while the process is down are not replayed in bulk; the next scheduled fire resumes from persisted schedule state
 
@@ -580,6 +665,9 @@ local result = ctx:invoke("ollama:chat", {
 Current config sections:
 
 ```toml
+[locale]
+timezone = "Europe/London"
+
 [scenes]
 enabled = true
 directory = "config/scenes"
@@ -594,10 +682,8 @@ directory = "config/automations"
 Not implemented yet:
 
 - hot reload for scenes or automations
-- cron or wall-clock scheduling beyond `interval`
-- room-scoped Lua helpers
-- direct device read helpers on `ctx`
-- explicit Lua logging helpers
+- first-class OR / nested boolean condition groups
+- per-condition timezone overrides
 
 ## Recommended Usage Split
 

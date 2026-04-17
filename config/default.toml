@@ -1,6 +1,9 @@
 [runtime]
 event_bus_capacity = 1024
 
+[locale]
+timezone = "UTC"
+
 [logging]
 level = "info"
 

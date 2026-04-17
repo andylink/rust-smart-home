@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
+use chrono_tz::Tz;
 use serde::Deserialize;
 
 use crate::runtime::RuntimeConfig;
@@ -9,6 +10,8 @@ use crate::runtime::RuntimeConfig;
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub runtime: RuntimeConfig,
+    #[serde(default)]
+    pub locale: LocaleConfig,
     pub logging: LoggingConfig,
     #[serde(default)]
     pub persistence: PersistenceConfig,
@@ -30,6 +33,12 @@ pub type AdaptersConfig = HashMap<String, AdapterConfig>;
 #[derive(Debug, Deserialize)]
 pub struct LoggingConfig {
     pub level: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LocaleConfig {
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,6 +84,14 @@ impl Default for ScenesConfig {
         Self {
             enabled: true,
             directory: "config/scenes".to_string(),
+        }
+    }
+}
+
+impl Default for LocaleConfig {
+    fn default() -> Self {
+        Self {
+            timezone: default_timezone(),
         }
     }
 }
@@ -181,6 +198,13 @@ impl Config {
             bail!("scenes.directory is required when scenes are enabled");
         }
 
+        self.locale.timezone.parse::<Tz>().map_err(|_| {
+            anyhow!(
+                "locale.timezone '{}' is not a valid IANA timezone",
+                self.locale.timezone
+            )
+        })?;
+
         if self.automations.enabled && self.automations.directory.trim().is_empty() {
             bail!("automations.directory is required when automations are enabled");
         }
@@ -209,6 +233,10 @@ impl Config {
 
 fn default_history_query_limit() -> usize {
     200
+}
+
+fn default_timezone() -> String {
+    "UTC".to_string()
 }
 
 fn default_history_max_query_limit() -> usize {

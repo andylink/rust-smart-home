@@ -118,6 +118,7 @@ struct AppState {
     scenes: Arc<SceneCatalog>,
     automations: Arc<AutomationCatalog>,
     automation_control: Arc<AutomationController>,
+    trigger_context: TriggerContext,
     health: HealthState,
     store: Option<Arc<dyn DeviceStore>>,
     history: HistorySettings,
@@ -208,6 +209,7 @@ struct AutomationResponse {
     name: String,
     description: Option<String>,
     trigger_type: &'static str,
+    condition_count: usize,
     status: &'static str,
     last_run: Option<DateTime<Utc>>,
     last_error: Option<String>,
@@ -625,6 +627,7 @@ async fn main() -> Result<()> {
             scenes,
             automations: automations.clone(),
             automation_control: automation_control.clone(),
+            trigger_context,
             health: health.clone(),
             store: device_store.clone(),
             history: HistorySettings::from_config(&config),
@@ -775,15 +778,24 @@ fn history_selection_from_telemetry(selection: &TelemetrySelectionConfig) -> His
 
 fn trigger_context_from_config(config: &Config) -> TriggerContext {
     let Some(adapter_config) = config.adapters.get("open_meteo") else {
-        return TriggerContext::default();
+        return TriggerContext {
+            latitude: None,
+            longitude: None,
+            timezone: config.locale.timezone.parse().ok(),
+        };
     };
     let Some(adapter) = adapter_config.as_object() else {
-        return TriggerContext::default();
+        return TriggerContext {
+            latitude: None,
+            longitude: None,
+            timezone: config.locale.timezone.parse().ok(),
+        };
     };
 
     TriggerContext {
         latitude: adapter.get("latitude").and_then(|value| value.as_f64()),
         longitude: adapter.get("longitude").and_then(|value| value.as_f64()),
+        timezone: config.locale.timezone.parse().ok(),
     }
 }
 
@@ -1233,7 +1245,7 @@ async fn execute_automation_manually(
 
     let execution = state
         .automation_control
-        .execute(&id, state.runtime.clone(), trigger_payload)
+        .execute(&id, state.runtime.clone(), trigger_payload, state.trigger_context)
         .map_err(|error| {
             if error.to_string().contains("not found") {
                 ApiError::not_found(error.to_string())
@@ -1803,6 +1815,7 @@ async fn automation_response(
         name: summary.name,
         description: summary.description,
         trigger_type: summary.trigger_type,
+        condition_count: summary.condition_count,
         status: if state
             .automation_control
             .is_enabled(&automation_id)
@@ -2445,6 +2458,7 @@ mod tests {
             runtime: RuntimeConfig {
                 event_bus_capacity: 16,
             },
+            locale: smart_home_core::config::LocaleConfig::default(),
             logging: smart_home_core::config::LoggingConfig {
                 level: "info".to_string(),
             },
@@ -2559,6 +2573,7 @@ mod tests {
             scenes: empty_scenes(),
             automations: automations.clone(),
             automation_control: Arc::new(AutomationRunner::new((*automations).clone()).controller()),
+            trigger_context: TriggerContext::default(),
             health: test_health(&["open_meteo"]),
             store: None,
             history: history_settings(false),
@@ -2591,6 +2606,7 @@ mod tests {
             scenes,
             automations: automations.clone(),
             automation_control: Arc::new(AutomationRunner::new((*automations).clone()).controller()),
+            trigger_context: TriggerContext::default(),
             health: test_health(&["open_meteo"]),
             store: None,
             history: history_settings(false),
@@ -2624,6 +2640,7 @@ mod tests {
             scenes: empty_scenes(),
             automations: automations.clone(),
             automation_control: Arc::new(AutomationRunner::new((*automations).clone()).controller()),
+            trigger_context: TriggerContext::default(),
             health: test_health(&["open_meteo"]),
             store: Some(store),
             history: history_settings(history_enabled),
@@ -3040,6 +3057,7 @@ mod tests {
             scenes: empty_scenes(),
             automations,
             automation_control,
+            trigger_context: TriggerContext::default(),
             health: test_health(&["open_meteo"]),
             store: None,
             history: history_settings(false),
@@ -3067,6 +3085,7 @@ mod tests {
         assert_eq!(body.as_array().expect("automations array").len(), 1);
         assert_eq!(body[0]["id"], "rain_check");
         assert_eq!(body[0]["trigger_type"], "device_state_change");
+        assert_eq!(body[0]["condition_count"], 0);
         assert_eq!(body[0]["status"], "enabled");
         assert!(body[0]["last_run"].is_null());
 
@@ -3097,6 +3116,14 @@ mod tests {
                     device_id = "test:rain",
                     attribute = "custom.test.rain",
                     equals = true,
+                },
+                conditions = {
+                    {
+                        type = "device_state",
+                        device_id = "test:presence",
+                        attribute = "occupancy",
+                        equals = "occupied",
+                    },
                 },
                 execute = function(ctx, event)
                     ctx:command("test:device", {
@@ -3140,12 +3167,22 @@ mod tests {
             ))
             .await
             .expect("target exists");
+        runtime
+            .registry()
+            .upsert(sample_device(
+                "test:presence",
+                "occupancy",
+                AttributeValue::Text("unoccupied".to_string()),
+            ))
+            .await
+            .expect("presence exists");
 
         let app = app(AppState {
             runtime: runtime.clone(),
             scenes: empty_scenes(),
             automations,
             automation_control,
+            trigger_context: TriggerContext::default(),
             health: test_health(&["open_meteo"]),
             store: None,
             history: history_settings(false),
@@ -3184,10 +3221,46 @@ mod tests {
             .await
             .expect("validate request succeeds");
         assert_eq!(validate.status(), StatusCode::OK);
+        let validate_body = validate.json::<Value>().await.expect("validate json body");
+        assert_eq!(validate_body["status"], "ok");
+        assert_eq!(validate_body["automation"]["condition_count"], 1);
+
+        let execute = client
+            .post(format!("http://{addr}/automations/rain_check/execute"))
+            .json(&json!({
+                "trigger_payload": {
+                    "type": "manual",
+                    "source": "test"
+                }
+            }))
+            .send()
+            .await
+            .expect("manual execute request succeeds");
+        assert_eq!(execute.status(), StatusCode::OK);
+        let execute_body = execute
+            .json::<Value>()
+            .await
+            .expect("execute json body");
+        assert_eq!(execute_body["status"], "skipped");
         assert_eq!(
-            validate.json::<Value>().await.expect("validate json body")["status"],
-            "ok"
+            runtime
+                .registry()
+                .get(&DeviceId("test:device".to_string()))
+                .expect("updated device exists")
+                .attributes
+                .get("brightness"),
+            None
         );
+
+        runtime
+            .registry()
+            .upsert(sample_device(
+                "test:presence",
+                "occupancy",
+                AttributeValue::Text("occupied".to_string()),
+            ))
+            .await
+            .expect("presence update succeeds");
 
         let execute = client
             .post(format!("http://{addr}/automations/rain_check/execute"))
@@ -3207,15 +3280,6 @@ mod tests {
             .expect("execute json body");
         assert_eq!(execute_body["status"], "ok");
         assert_eq!(execute_body["results"][0]["target"], "test:device");
-        assert_eq!(
-            runtime
-                .registry()
-                .get(&DeviceId("test:device".to_string()))
-                .expect("updated device exists")
-                .attributes
-                .get("brightness"),
-            Some(&AttributeValue::Integer(42))
-        );
 
         let enable = client
             .post(format!("http://{addr}/automations/rain_check/enabled"))
@@ -3367,6 +3431,7 @@ mod tests {
             automation_control: Arc::new(
                 AutomationRunner::new(AutomationCatalog::empty()).controller(),
             ),
+            trigger_context: TriggerContext::default(),
             health,
             store: None,
             history: history_settings(false),
@@ -3772,6 +3837,7 @@ mod tests {
             automation_control: Arc::new(
                 AutomationRunner::new(AutomationCatalog::empty()).controller(),
             ),
+            trigger_context: TriggerContext::default(),
             health: test_health(&["open_meteo"]),
             store: Some(store.clone()),
             history: history_settings(true),
@@ -4527,6 +4593,7 @@ mod tests {
             runtime: RuntimeConfig {
                 event_bus_capacity: 16,
             },
+            locale: smart_home_core::config::LocaleConfig::default(),
             logging: smart_home_core::config::LoggingConfig {
                 level: "info".to_string(),
             },

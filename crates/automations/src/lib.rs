@@ -1,17 +1,18 @@
 use std::collections::HashMap;
 use std::fs;
-use std::str::FromStr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono_tz::Tz;
 use cron::Schedule;
 use mlua::{Function, HookTriggers, Lua, VmState};
 use serde::Serialize;
 use smart_home_core::event::Event;
-use smart_home_core::model::{AttributeValue, Attributes, DeviceId};
+use smart_home_core::model::{AttributeValue, Attributes, DeviceId, RoomId};
 use smart_home_core::runtime::Runtime;
 use smart_home_core::store::{
     AutomationExecutionHistoryEntry, AutomationRuntimeState, DeviceStore, SceneStepResult,
@@ -33,6 +34,7 @@ pub struct AutomationSummary {
     pub name: String,
     pub description: Option<String>,
     pub trigger_type: &'static str,
+    pub condition_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +42,7 @@ pub struct Automation {
     pub summary: AutomationSummary,
     path: PathBuf,
     trigger: Trigger,
+    conditions: Vec<Condition>,
     runtime_state_policy: RuntimeStatePolicy,
 }
 
@@ -81,13 +84,6 @@ enum Trigger {
         debounce_secs: Option<u64>,
         duration_secs: Option<u64>,
     },
-    DeviceRoomChange {
-        device_id: Option<String>,
-        room_id: Option<String>,
-    },
-    RoomChange {
-        room_id: Option<String>,
-    },
     AdapterLifecycle {
         adapter: Option<String>,
         event: AdapterLifecycleEvent,
@@ -125,10 +121,57 @@ struct ThresholdTrigger {
     below: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum Condition {
+    DeviceState {
+        device_id: String,
+        attribute: String,
+        equals: Option<AttributeValue>,
+        threshold: Option<ThresholdCondition>,
+    },
+    TimeWindow {
+        start: NaiveTime,
+        end: NaiveTime,
+    },
+    Presence {
+        device_id: String,
+        attribute: String,
+        equals: AttributeValue,
+    },
+    RoomState {
+        room_id: String,
+        min_devices: Option<usize>,
+        max_devices: Option<usize>,
+    },
+    SunPosition {
+        after: Option<SolarConditionPoint>,
+        before: Option<SolarConditionPoint>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ThresholdCondition {
+    above: Option<f64>,
+    below: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SolarConditionPoint {
+    event: SolarEventKind,
+    offset_mins: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SolarEventKind {
+    Sunrise,
+    Sunset,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TriggerContext {
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
+    pub timezone: Option<Tz>,
 }
 
 #[derive(Clone)]
@@ -154,6 +197,7 @@ pub struct AutomationStateStore {
 struct ExecutionControl {
     semaphore: Arc<Semaphore>,
     timeout: Duration,
+    trigger_context: TriggerContext,
 }
 
 pub trait AutomationExecutionObserver: Send + Sync {
@@ -279,12 +323,30 @@ impl AutomationCatalog {
         id: &str,
         runtime: Arc<Runtime>,
         trigger_payload: AttributeValue,
+        trigger_context: TriggerContext,
     ) -> Result<AutomationExecutionResult> {
         let automation = self
             .automations
             .iter()
             .find(|automation| automation.summary.id == id)
             .with_context(|| format!("automation '{id}' not found"))?;
+
+        if let Some(reason) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(first_failed_condition(
+                automation,
+                runtime.as_ref(),
+                &trigger_payload,
+                Utc::now(),
+                trigger_context,
+            ))
+        }) {
+            return Ok(AutomationExecutionResult {
+                status: "skipped".to_string(),
+                error: Some(reason),
+                results: Vec::new(),
+                duration_ms: 0,
+            });
+        }
 
         let record = execute_automation(
             automation,
@@ -350,11 +412,13 @@ impl AutomationRunner {
     }
 
     pub async fn run(self, runtime: Arc<Runtime>) {
+        let trigger_context = self.trigger_context;
         self.run_with_options(
             runtime,
             ExecutionControl {
                 semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_AUTOMATIONS)),
                 timeout: AUTOMATION_EXECUTION_TIMEOUT,
+                trigger_context,
             },
         )
         .await;
@@ -472,8 +536,11 @@ impl AutomationController {
         id: &str,
         runtime: Arc<Runtime>,
         trigger_payload: AttributeValue,
+        trigger_context: TriggerContext,
     ) -> Result<AutomationExecutionResult> {
-        let result = self.catalog.execute(id, runtime, trigger_payload.clone())?;
+        let result = self
+            .catalog
+            .execute(id, runtime, trigger_payload.clone(), trigger_context)?;
         if let Some(observer) = &self.observer {
             observer.record(AutomationExecutionHistoryEntry {
                 executed_at: Utc::now(),
@@ -658,7 +725,7 @@ async fn run_scheduled_trigger_loop(
             None => break,
         };
 
-        let event = scheduled_trigger_event(&automation.trigger, scheduled_for);
+        let event = scheduled_trigger_event(&automation.trigger, scheduled_for, trigger_context);
         execute_scheduled_automation(
             runtime.clone(),
             &automation,
@@ -697,6 +764,30 @@ async fn execute_scheduled_automation(
         .await
         .is_skip()
     {
+        return;
+    }
+
+    let evaluation_time = scheduled_for.unwrap_or_else(Utc::now);
+    if let Some(reason) = first_failed_condition(
+        automation,
+        runtime.as_ref(),
+        &event,
+        evaluation_time,
+        execution.trigger_context,
+    )
+    .await
+    {
+        notify_observer(
+            observer.as_ref(),
+            automation,
+            event,
+            AutomationExecutionRecord {
+                status: "skipped".to_string(),
+                error: Some(reason),
+                results: Vec::new(),
+                duration_ms: 0,
+            },
+        );
         return;
     }
 
@@ -778,7 +869,15 @@ async fn execute_scheduled_automation(
     }
 }
 
-fn scheduled_trigger_event(trigger: &Trigger, scheduled_at: DateTime<Utc>) -> AttributeValue {
+fn scheduled_trigger_event(
+    trigger: &Trigger,
+    scheduled_at: DateTime<Utc>,
+    trigger_context: TriggerContext,
+) -> AttributeValue {
+    let timezone = trigger_context
+        .timezone
+        .map(|timezone: Tz| timezone.name().to_string())
+        .unwrap_or_else(|| "UTC".to_string());
     match trigger {
         Trigger::WallClock { hour, minute } => AttributeValue::Object(HashMap::from([
             (
@@ -799,7 +898,7 @@ fn scheduled_trigger_event(trigger: &Trigger, scheduled_at: DateTime<Utc>) -> At
             ),
             (
                 "timezone".to_string(),
-                AttributeValue::Text("UTC".to_string()),
+                AttributeValue::Text(timezone.clone()),
             ),
         ])),
         Trigger::Cron { expression, .. } => AttributeValue::Object(HashMap::from([
@@ -817,7 +916,7 @@ fn scheduled_trigger_event(trigger: &Trigger, scheduled_at: DateTime<Utc>) -> At
             ),
             (
                 "timezone".to_string(),
-                AttributeValue::Text("UTC".to_string()),
+                AttributeValue::Text(timezone.clone()),
             ),
         ])),
         Trigger::Sunrise { offset_mins } => AttributeValue::Object(HashMap::from([
@@ -835,7 +934,7 @@ fn scheduled_trigger_event(trigger: &Trigger, scheduled_at: DateTime<Utc>) -> At
             ),
             (
                 "timezone".to_string(),
-                AttributeValue::Text("UTC".to_string()),
+                AttributeValue::Text(timezone.clone()),
             ),
         ])),
         Trigger::Sunset { offset_mins } => AttributeValue::Object(HashMap::from([
@@ -853,7 +952,7 @@ fn scheduled_trigger_event(trigger: &Trigger, scheduled_at: DateTime<Utc>) -> At
             ),
             (
                 "timezone".to_string(),
-                AttributeValue::Text("UTC".to_string()),
+                AttributeValue::Text(timezone),
             ),
         ])),
         _ => AttributeValue::Object(HashMap::from([(
@@ -869,7 +968,7 @@ fn next_schedule_time(
     trigger_context: TriggerContext,
 ) -> Option<DateTime<Utc>> {
     match trigger {
-        Trigger::WallClock { hour, minute } => next_wall_clock_occurrence(*hour, *minute, after),
+        Trigger::WallClock { hour, minute } => next_wall_clock_occurrence(*hour, *minute, after, trigger_context),
         Trigger::Cron { schedule, .. } => schedule.after(&after).next(),
         Trigger::Sunrise { offset_mins } => next_solar_occurrence(after, trigger_context, true, *offset_mins),
         Trigger::Sunset { offset_mins } => next_solar_occurrence(after, trigger_context, false, *offset_mins),
@@ -917,19 +1016,22 @@ fn next_wall_clock_occurrence(
     hour: u32,
     minute: u32,
     after: DateTime<Utc>,
+    trigger_context: TriggerContext,
 ) -> Option<DateTime<Utc>> {
-    let scheduled_today = after
+    let timezone = trigger_context.timezone.unwrap_or(Tz::UTC);
+    let local_after = after.with_timezone(&timezone);
+    let scheduled_today = local_after
         .date_naive()
         .and_hms_opt(hour, minute, 0)?;
-    let scheduled_today = DateTime::<Utc>::from_naive_utc_and_offset(scheduled_today, Utc);
+    let scheduled_today = timezone.from_local_datetime(&scheduled_today).single()?;
 
-    if scheduled_today > after {
-        return Some(scheduled_today);
+    if scheduled_today.with_timezone(&Utc) > after {
+        return Some(scheduled_today.with_timezone(&Utc));
     }
 
-    let next_day = after.date_naive().checked_add_signed(ChronoDuration::days(1))?;
+    let next_day = local_after.date_naive().checked_add_signed(ChronoDuration::days(1))?;
     let scheduled_next = next_day.and_hms_opt(hour, minute, 0)?;
-    Some(DateTime::<Utc>::from_naive_utc_and_offset(scheduled_next, Utc))
+    Some(timezone.from_local_datetime(&scheduled_next).single()?.with_timezone(&Utc))
 }
 
 fn spawn_automation_execution(
@@ -976,6 +1078,29 @@ fn spawn_automation_execution(
         .await
         .is_skip()
         {
+            return;
+        }
+
+        if let Some(reason) = first_failed_condition(
+            &automation,
+            runtime.as_ref(),
+            &event,
+            Utc::now(),
+            execution.trigger_context,
+        )
+        .await
+        {
+            notify_observer(
+                observer.as_ref(),
+                &automation,
+                event,
+                AutomationExecutionRecord {
+                    status: "skipped".to_string(),
+                    error: Some(reason),
+                    results: Vec::new(),
+                    duration_ms: 0,
+                },
+            );
             return;
         }
 
@@ -1135,6 +1260,165 @@ fn delayed_trigger_target(event: &AttributeValue) -> Option<(String, String, Att
     };
     let value = fields.get("value")?.clone();
     Some((device_id.clone(), attribute.clone(), value))
+}
+
+async fn first_failed_condition(
+    automation: &Automation,
+    runtime: &Runtime,
+    event: &AttributeValue,
+    now: DateTime<Utc>,
+    trigger_context: TriggerContext,
+) -> Option<String> {
+    for (index, condition) in automation.conditions.iter().enumerate() {
+        if let Err(error) = evaluate_condition(condition, runtime, event, now, trigger_context).await {
+            return Some(format!("condition {} failed: {error}", index + 1));
+        }
+    }
+
+    None
+}
+
+async fn evaluate_condition(
+    condition: &Condition,
+    runtime: &Runtime,
+    _event: &AttributeValue,
+    now: DateTime<Utc>,
+    trigger_context: TriggerContext,
+) -> Result<()> {
+    match condition {
+        Condition::DeviceState {
+            device_id,
+            attribute,
+            equals,
+            threshold,
+        } => {
+            let device = runtime
+                .registry()
+                .get(&DeviceId(device_id.clone()))
+                .with_context(|| format!("device '{device_id}' not found"))?;
+            let value = device
+                .attributes
+                .get(attribute)
+                .with_context(|| format!("attribute '{attribute}' missing on '{device_id}'"))?;
+            if !condition_value_matches(value, equals.as_ref(), threshold.as_ref()) {
+                bail!("device_state did not match")
+            }
+            Ok(())
+        }
+        Condition::Presence {
+            device_id,
+            attribute,
+            equals,
+        } => {
+            let device = runtime
+                .registry()
+                .get(&DeviceId(device_id.clone()))
+                .with_context(|| format!("device '{device_id}' not found"))?;
+            let value = device
+                .attributes
+                .get(attribute)
+                .with_context(|| format!("attribute '{attribute}' missing on '{device_id}'"))?;
+            if value != equals {
+                bail!("presence did not match")
+            }
+            Ok(())
+        }
+        Condition::TimeWindow { start, end } => {
+            let timezone = trigger_context
+                .timezone
+                .with_context(|| "automation timezone is not configured")?;
+            let local_time = now.with_timezone(&timezone).time();
+            let in_window = if start <= end {
+                local_time >= *start && local_time <= *end
+            } else {
+                local_time >= *start || local_time <= *end
+            };
+            if !in_window {
+                bail!("time_window did not match")
+            }
+            Ok(())
+        }
+        Condition::RoomState {
+            room_id,
+            min_devices,
+            max_devices,
+        } => {
+            let count = runtime
+                .registry()
+                .list_devices_in_room(&RoomId(room_id.clone()))
+                .len();
+            if let Some(min_devices) = min_devices {
+                if count < *min_devices {
+                    bail!("room_state below min_devices")
+                }
+            }
+            if let Some(max_devices) = max_devices {
+                if count > *max_devices {
+                    bail!("room_state above max_devices")
+                }
+            }
+            Ok(())
+        }
+        Condition::SunPosition { after, before } => {
+            let date = now.date_naive();
+            if let Some(after) = after {
+                let after_time = solar_condition_time(date, after, trigger_context)
+                    .with_context(|| "sun_position after point could not be resolved")?;
+                if now < after_time {
+                    bail!("sun_position after point not reached")
+                }
+            }
+            if let Some(before) = before {
+                let before_time = solar_condition_time(date, before, trigger_context)
+                    .with_context(|| "sun_position before point could not be resolved")?;
+                if now > before_time {
+                    bail!("sun_position before point passed")
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn condition_value_matches(
+    value: &AttributeValue,
+    equals: Option<&AttributeValue>,
+    threshold: Option<&ThresholdCondition>,
+) -> bool {
+    if let Some(expected) = equals {
+        return value == expected;
+    }
+    if let Some(threshold) = threshold {
+        let Some(number) = attribute_value_to_f64(value) else {
+            return false;
+        };
+        if let Some(above) = threshold.above {
+            if number <= above {
+                return false;
+            }
+        }
+        if let Some(below) = threshold.below {
+            if number >= below {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn solar_condition_time(
+    date: NaiveDate,
+    point: &SolarConditionPoint,
+    trigger_context: TriggerContext,
+) -> Option<DateTime<Utc>> {
+    let sunrise = matches!(point.event, SolarEventKind::Sunrise);
+    solar_event_time(
+        date,
+        trigger_context.latitude?,
+        trigger_context.longitude?,
+        sunrise,
+        point.offset_mins,
+    )
 }
 
 async fn should_skip_trigger(
@@ -1493,38 +1777,6 @@ fn automation_event_from_runtime_event(
             None,
         ),
         (
-            Trigger::DeviceRoomChange { device_id, room_id },
-            Event::DeviceRoomChanged { id, room_id: changed_room_id },
-        ) => {
-            if let Some(expected_device_id) = device_id {
-                if &id.0 != expected_device_id {
-                    return None;
-                }
-            }
-            if let Some(expected_room_id) = room_id {
-                if changed_room_id.as_ref().map(|value| value.0.as_str()) != Some(expected_room_id.as_str()) {
-                    return None;
-                }
-            }
-
-            Some(device_room_change_event(&id.0, changed_room_id.as_ref().map(|value| value.0.as_str())))
-        }
-        (Trigger::RoomChange { room_id }, Event::RoomAdded { room })
-        | (Trigger::RoomChange { room_id }, Event::RoomUpdated { room }) => {
-            if room_id.as_deref().is_some_and(|expected| expected != room.id.0) {
-                return None;
-            }
-
-            Some(room_change_event(room, false))
-        }
-        (Trigger::RoomChange { room_id }, Event::RoomRemoved { id }) => {
-            if room_id.as_deref().is_some_and(|expected| expected != id.0) {
-                return None;
-            }
-
-            Some(room_removed_event(&id.0))
-        }
-        (
             Trigger::AdapterLifecycle { adapter, event },
             Event::AdapterStarted { adapter: started_adapter },
         ) => {
@@ -1595,43 +1847,6 @@ fn automation_event_from_registry_snapshot(
                 *duration_secs,
                 skipped,
             )
-        }
-        Trigger::DeviceRoomChange { device_id, room_id } => {
-            let device = match device_id {
-                Some(device_id) => registry.get(&DeviceId(device_id.clone()))?,
-                None => registry
-                    .list()
-                    .into_iter()
-                    .find(|device| match room_id {
-                        Some(expected_room_id) => {
-                            device.room_id.as_ref().map(|value| value.0.as_str())
-                                == Some(expected_room_id.as_str())
-                        }
-                        None => true,
-                    })?,
-            };
-
-            if let Some(expected_room_id) = room_id {
-                if device.room_id.as_ref().map(|value| value.0.as_str()) != Some(expected_room_id.as_str()) {
-                    return None;
-                }
-            }
-
-            Some(recovered_event(
-                device_room_change_event(
-                    &device.id.0,
-                    device.room_id.as_ref().map(|value| value.0.as_str()),
-                ),
-                skipped,
-            ))
-        }
-        Trigger::RoomChange { room_id } => {
-            let room = match room_id {
-                Some(room_id) => registry.get_room(&smart_home_core::model::RoomId(room_id.clone()))?,
-                None => registry.list_rooms().into_iter().next()?,
-            };
-
-            Some(recovered_event(room_change_event(&room, false), skipped))
         }
         _ => None,
     }
@@ -1901,67 +2116,6 @@ fn device_state_change_event(
     AttributeValue::Object(event)
 }
 
-fn device_room_change_event(device_id: &str, room_id: Option<&str>) -> AttributeValue {
-    let mut event = HashMap::from([
-        (
-            "type".to_string(),
-            AttributeValue::Text("device_room_change".to_string()),
-        ),
-        (
-            "device_id".to_string(),
-            AttributeValue::Text(device_id.to_string()),
-        ),
-    ]);
-
-    event.insert(
-        "room_id".to_string(),
-        room_id
-            .map(|room_id| AttributeValue::Text(room_id.to_string()))
-            .unwrap_or(AttributeValue::Null),
-    );
-
-    AttributeValue::Object(event)
-}
-
-fn room_change_event(room: &smart_home_core::model::Room, recovered: bool) -> AttributeValue {
-    let mut event = HashMap::from([
-        (
-            "type".to_string(),
-            AttributeValue::Text("room_change".to_string()),
-        ),
-        (
-            "room_id".to_string(),
-            AttributeValue::Text(room.id.0.clone()),
-        ),
-        (
-            "name".to_string(),
-            AttributeValue::Text(room.name.clone()),
-        ),
-    ]);
-
-    if recovered {
-        event.insert("recovered".to_string(), AttributeValue::Bool(true));
-    }
-
-    AttributeValue::Object(event)
-}
-
-fn room_removed_event(room_id: &str) -> AttributeValue {
-    AttributeValue::Object(HashMap::from([
-        (
-            "type".to_string(),
-            AttributeValue::Text("room_change".to_string()),
-        ),
-        (
-            "room_id".to_string(),
-            AttributeValue::Text(room_id.to_string()),
-        ),
-        (
-            "removed".to_string(),
-            AttributeValue::Bool(true),
-        ),
-    ]))
-}
 
 fn adapter_started_event(adapter: &str) -> AttributeValue {
     AttributeValue::Object(HashMap::from([
@@ -1993,18 +2147,6 @@ fn system_error_event(message: &str) -> AttributeValue {
     ]))
 }
 
-fn recovered_event(event: AttributeValue, skipped: u64) -> AttributeValue {
-    let AttributeValue::Object(mut fields) = event else {
-        return event;
-    };
-    fields.insert("recovered".to_string(), AttributeValue::Bool(true));
-    fields.insert(
-        "skipped_events".to_string(),
-        AttributeValue::Integer(skipped as i64),
-    );
-    AttributeValue::Object(fields)
-}
-
 fn load_automation_file(path: &Path, scripts_root: Option<&Path>) -> Result<Automation> {
     let source = fs::read_to_string(path)
         .with_context(|| format!("failed to read automation file {}", path.display()))?;
@@ -2030,6 +2172,7 @@ fn load_automation_file(path: &Path, scripts_root: Option<&Path>) -> Result<Auto
         )
     })?;
     let trigger = parse_trigger(trigger_value, path)?;
+    let conditions = parse_conditions(&module, path)?;
 
     if id.trim().is_empty() {
         bail!("automation file {} has empty id", path.display());
@@ -2061,9 +2204,11 @@ fn load_automation_file(path: &Path, scripts_root: Option<&Path>) -> Result<Auto
             name,
             description,
             trigger_type: trigger_type_name(&trigger),
+            condition_count: conditions.len(),
         },
         path: path.to_path_buf(),
         trigger,
+        conditions,
         runtime_state_policy,
     })
 }
@@ -2224,39 +2369,6 @@ fn parse_trigger(value: mlua::Value, path: &Path) -> Result<Trigger> {
                 duration_secs,
             })
         }
-        "device_room_change" => {
-            let device_id = table.get::<Option<String>>("device_id").map_err(|error| {
-                anyhow::anyhow!(
-                    "automation file {} trigger field 'device_id' is invalid: {error}",
-                    path.display()
-                )
-            })?;
-            let room_id = table.get::<Option<String>>("room_id").map_err(|error| {
-                anyhow::anyhow!(
-                    "automation file {} trigger field 'room_id' is invalid: {error}",
-                    path.display()
-                )
-            })?;
-
-            if device_id.is_none() && room_id.is_none() {
-                bail!(
-                    "automation file {} device_room_change trigger requires 'device_id' or 'room_id'",
-                    path.display()
-                );
-            }
-
-            Ok(Trigger::DeviceRoomChange { device_id, room_id })
-        }
-        "room_change" => {
-            let room_id = table.get::<Option<String>>("room_id").map_err(|error| {
-                anyhow::anyhow!(
-                    "automation file {} trigger field 'room_id' is invalid: {error}",
-                    path.display()
-                )
-            })?;
-
-            Ok(Trigger::RoomChange { room_id })
-        }
         "adapter_lifecycle" => {
             let adapter = table.get::<Option<String>>("adapter").map_err(|error| {
                 anyhow::anyhow!(
@@ -2386,9 +2498,178 @@ fn parse_trigger(value: mlua::Value, path: &Path) -> Result<Trigger> {
             Ok(Trigger::Interval { every_secs })
         }
         _ => bail!(
-            "automation file {} has unsupported trigger type '{}'; supported types are device_state_change, weather_state, device_room_change, room_change, adapter_lifecycle, system_error, wall_clock, cron, sunrise, sunset, and interval",
+            "automation file {} has unsupported trigger type '{}'; supported types are device_state_change, weather_state, adapter_lifecycle, system_error, wall_clock, cron, sunrise, sunset, and interval",
             path.display(),
             trigger_type
+        ),
+    }
+}
+
+fn parse_conditions(module: &mlua::Table, path: &Path) -> Result<Vec<Condition>> {
+    let conditions = module.get::<Option<mlua::Table>>("conditions").map_err(|error| {
+        anyhow::anyhow!(
+            "automation file {} has invalid optional field 'conditions': {error}",
+            path.display()
+        )
+    })?;
+    let Some(conditions) = conditions else {
+        return Ok(Vec::new());
+    };
+
+    let mut parsed = Vec::new();
+    for value in conditions.sequence_values::<mlua::Value>() {
+        let value = value.map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        parsed.push(parse_condition(value, path)?);
+    }
+    Ok(parsed)
+}
+
+fn parse_condition(value: mlua::Value, path: &Path) -> Result<Condition> {
+    let mlua::Value::Table(table) = value else {
+        bail!("automation file {} condition entries must be tables", path.display());
+    };
+    let condition_type = table.get::<String>("type").map_err(|error| {
+        anyhow::anyhow!(
+            "automation file {} condition is missing string field 'type': {error}",
+            path.display()
+        )
+    })?;
+
+    match condition_type.as_str() {
+        "device_state" => {
+            let device_id = table.get::<String>("device_id").map_err(|error| {
+                anyhow::anyhow!(
+                    "automation file {} device_state condition requires 'device_id': {error}",
+                    path.display()
+                )
+            })?;
+            let attribute = table.get::<String>("attribute").map_err(|error| {
+                anyhow::anyhow!(
+                    "automation file {} device_state condition requires 'attribute': {error}",
+                    path.display()
+                )
+            })?;
+            let equals = match table.get::<mlua::Value>("equals") {
+                Ok(mlua::Value::Nil) => None,
+                Ok(value) => Some(
+                    smart_home_lua_host::lua_value_to_attribute(value)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+                ),
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "automation file {} device_state condition field 'equals' is invalid: {error}",
+                        path.display()
+                    ))
+                }
+            };
+            let threshold = parse_threshold_condition(&table, path, "device_state")?;
+            validate_condition_value_match(path, "device_state", equals.as_ref(), threshold.as_ref())?;
+            Ok(Condition::DeviceState {
+                device_id,
+                attribute,
+                equals,
+                threshold,
+            })
+        }
+        "presence" => {
+            let device_id = table.get::<String>("device_id").map_err(|error| {
+                anyhow::anyhow!(
+                    "automation file {} presence condition requires 'device_id': {error}",
+                    path.display()
+                )
+            })?;
+            let attribute = table.get::<Option<String>>("attribute").map_err(|error| {
+                anyhow::anyhow!(
+                    "automation file {} presence condition field 'attribute' is invalid: {error}",
+                    path.display()
+                )
+            })?.unwrap_or_else(|| "presence".to_string());
+            let equals = match table.get::<mlua::Value>("equals") {
+                Ok(mlua::Value::Nil) => AttributeValue::Bool(true),
+                Ok(value) => smart_home_lua_host::lua_value_to_attribute(value)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "automation file {} presence condition field 'equals' is invalid: {error}",
+                        path.display()
+                    ))
+                }
+            };
+            Ok(Condition::Presence {
+                device_id,
+                attribute,
+                equals,
+            })
+        }
+        "time_window" => {
+            let start = parse_clock_time(
+                &table.get::<String>("start").map_err(|error| {
+                    anyhow::anyhow!(
+                        "automation file {} time_window condition requires 'start': {error}",
+                        path.display()
+                    )
+                })?,
+                path,
+                "start",
+            )?;
+            let end = parse_clock_time(
+                &table.get::<String>("end").map_err(|error| {
+                    anyhow::anyhow!(
+                        "automation file {} time_window condition requires 'end': {error}",
+                        path.display()
+                    )
+                })?,
+                path,
+                "end",
+            )?;
+            Ok(Condition::TimeWindow { start, end })
+        }
+        "room_state" => {
+            let room_id = table.get::<String>("room_id").map_err(|error| {
+                anyhow::anyhow!(
+                    "automation file {} room_state condition requires 'room_id': {error}",
+                    path.display()
+                )
+            })?;
+            let min_devices = table.get::<Option<usize>>("min_devices").map_err(|error| {
+                anyhow::anyhow!(
+                    "automation file {} room_state condition field 'min_devices' is invalid: {error}",
+                    path.display()
+                )
+            })?;
+            let max_devices = table.get::<Option<usize>>("max_devices").map_err(|error| {
+                anyhow::anyhow!(
+                    "automation file {} room_state condition field 'max_devices' is invalid: {error}",
+                    path.display()
+                )
+            })?;
+            if min_devices.is_none() && max_devices.is_none() {
+                bail!(
+                    "automation file {} room_state condition requires 'min_devices' or 'max_devices'",
+                    path.display()
+                );
+            }
+            Ok(Condition::RoomState {
+                room_id,
+                min_devices,
+                max_devices,
+            })
+        }
+        "sun_position" => {
+            let after = parse_solar_condition_point(&table, path, "after")?;
+            let before = parse_solar_condition_point(&table, path, "before")?;
+            if after.is_none() && before.is_none() {
+                bail!(
+                    "automation file {} sun_position condition requires 'after' or 'before'",
+                    path.display()
+                );
+            }
+            Ok(Condition::SunPosition { after, before })
+        }
+        _ => bail!(
+            "automation file {} has unsupported condition type '{}'; supported types are device_state, presence, time_window, room_state, and sun_position",
+            path.display(),
+            condition_type
         ),
     }
 }
@@ -2418,6 +2699,108 @@ fn parse_threshold_trigger(
     }
 
     Ok(Some(ThresholdTrigger { above, below }))
+}
+
+fn parse_threshold_condition(
+    table: &mlua::Table,
+    path: &Path,
+    condition_type: &str,
+) -> Result<Option<ThresholdCondition>> {
+    let above = table.get::<Option<f64>>("above").map_err(|error| {
+        anyhow::anyhow!(
+            "automation file {} {} condition field 'above' is invalid: {error}",
+            path.display(),
+            condition_type
+        )
+    })?;
+    let below = table.get::<Option<f64>>("below").map_err(|error| {
+        anyhow::anyhow!(
+            "automation file {} {} condition field 'below' is invalid: {error}",
+            path.display(),
+            condition_type
+        )
+    })?;
+
+    if above.is_none() && below.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(ThresholdCondition { above, below }))
+}
+
+fn validate_condition_value_match(
+    path: &Path,
+    condition_type: &str,
+    equals: Option<&AttributeValue>,
+    threshold: Option<&ThresholdCondition>,
+) -> Result<()> {
+    if equals.is_some() && threshold.is_some() {
+        bail!(
+            "automation file {} {} condition cannot combine 'equals' with 'above'/'below'",
+            path.display(),
+            condition_type
+        );
+    }
+    if equals.is_none() && threshold.is_none() {
+        bail!(
+            "automation file {} {} condition requires 'equals' or 'above'/'below'",
+            path.display(),
+            condition_type
+        );
+    }
+    Ok(())
+}
+
+fn parse_clock_time(value: &str, path: &Path, field: &str) -> Result<NaiveTime> {
+    NaiveTime::parse_from_str(value, "%H:%M").map_err(|error| {
+        anyhow::anyhow!(
+            "automation file {} time value '{}' for '{}' is invalid: {}",
+            path.display(),
+            value,
+            field,
+            error
+        )
+    })
+}
+
+fn parse_solar_condition_point(
+    table: &mlua::Table,
+    path: &Path,
+    prefix: &str,
+) -> Result<Option<SolarConditionPoint>> {
+    let Some(event_name) = table.get::<Option<String>>(prefix).map_err(|error| {
+        anyhow::anyhow!(
+            "automation file {} sun_position condition field '{}' is invalid: {error}",
+            path.display(),
+            prefix
+        )
+    })? else {
+        return Ok(None);
+    };
+
+    let offset_field = format!("{}_offset_mins", prefix);
+    let offset_mins = table.get::<Option<i64>>(offset_field.as_str()).map_err(|error| {
+        anyhow::anyhow!(
+            "automation file {} sun_position condition field '{}' is invalid: {error}",
+            path.display(),
+            offset_field
+        )
+    })?.unwrap_or(0);
+
+    let event = match event_name.as_str() {
+        "sunrise" => SolarEventKind::Sunrise,
+        "sunset" => SolarEventKind::Sunset,
+        other => {
+            bail!(
+                "automation file {} sun_position condition field '{}' has unsupported value '{}'; supported values are sunrise and sunset",
+                path.display(),
+                prefix,
+                other
+            )
+        }
+    };
+
+    Ok(Some(SolarConditionPoint { event, offset_mins }))
 }
 
 fn validate_extended_device_trigger(
@@ -2472,8 +2855,6 @@ fn trigger_type_name(trigger: &Trigger) -> &'static str {
     match trigger {
         Trigger::DeviceStateChange { .. } => "device_state_change",
         Trigger::WeatherState { .. } => "weather_state",
-        Trigger::DeviceRoomChange { .. } => "device_room_change",
-        Trigger::RoomChange { .. } => "room_change",
         Trigger::AdapterLifecycle { .. } => "adapter_lifecycle",
         Trigger::SystemError { .. } => "system_error",
         Trigger::WallClock { .. } => "wall_clock",
@@ -2489,8 +2870,6 @@ fn trigger_uses_event_bus(automation: &Automation) -> bool {
         automation.trigger,
         Trigger::DeviceStateChange { .. }
             | Trigger::WeatherState { .. }
-            | Trigger::DeviceRoomChange { .. }
-            | Trigger::RoomChange { .. }
             | Trigger::AdapterLifecycle { .. }
             | Trigger::SystemError { .. }
     )
@@ -2660,6 +3039,22 @@ mod tests {
         }
     }
 
+    fn attribute_device(id: &str, attribute: &str, value: AttributeValue) -> Device {
+        Device {
+            id: DeviceId(id.to_string()),
+            room_id: None,
+            kind: DeviceKind::Sensor,
+            attributes: HashMap::from([(attribute.to_string(), value)]),
+            metadata: Metadata {
+                source: "test".to_string(),
+                accuracy: None,
+                vendor_specific: HashMap::new(),
+            },
+            updated_at: Utc::now(),
+            last_seen: Utc::now(),
+        }
+    }
+
     fn target_device(id: &str) -> Device {
         Device {
             id: DeviceId(id.to_string()),
@@ -2673,13 +3068,6 @@ mod tests {
             },
             updated_at: Utc::now(),
             last_seen: Utc::now(),
-        }
-    }
-
-    fn sample_room(id: &str, name: &str) -> Room {
-        Room {
-            id: RoomId(id.to_string()),
-            name: name.to_string(),
         }
     }
 
@@ -2713,31 +3101,23 @@ mod tests {
         let dir = temp_dir("smart-home-automations");
         write_automation(
             &dir,
-            "room.lua",
+            "event.lua",
             r#"return {
-                id = "room_watch",
-                name = "Room Watch",
-                trigger = {
-                    type = "room_change",
-                    room_id = "outside",
-                },
-                execute = function(ctx, event)
-                end
-            }"#,
-        );
-        write_automation(
-            &dir,
-            "adapter.lua",
-            r#"return {
-                id = "adapter_watch",
-                name = "Adapter Watch",
+                id = "event_watch",
+                name = "Event Watch",
                 trigger = {
                     type = "adapter_lifecycle",
                     adapter = "test",
                     event = "started",
                 },
+                conditions = {
+                    {
+                        type = "sun_position",
+                        after = "sunset",
+                    },
+                },
                 execute = function(ctx, event)
-                end
+                end,
             }"#,
         );
 
@@ -2745,10 +3125,9 @@ mod tests {
         let trigger_types = catalog
             .summaries()
             .into_iter()
-            .map(|summary| summary.trigger_type)
+            .map(|summary| (summary.trigger_type, summary.condition_count))
             .collect::<Vec<_>>();
-        assert!(trigger_types.contains(&"room_change"));
-        assert!(trigger_types.contains(&"adapter_lifecycle"));
+        assert!(trigger_types.contains(&("adapter_lifecycle", 1)));
     }
 
     #[test]
@@ -2893,7 +3272,8 @@ mod tests {
                 .expect("valid time"),
         );
 
-        let next = next_wall_clock_occurrence(6, 30, after).expect("next schedule exists");
+        let next = next_wall_clock_occurrence(6, 30, after, TriggerContext::default())
+            .expect("next schedule exists");
         assert_eq!(next.day(), 17);
         assert_eq!(next.hour(), 6);
         assert_eq!(next.minute(), 30);
@@ -2929,6 +3309,7 @@ mod tests {
         let context = TriggerContext {
             latitude: Some(51.5),
             longitude: Some(-0.1),
+            timezone: None,
         };
 
         let sunrise = next_schedule_time(&Trigger::Sunrise { offset_mins: 0 }, after, context)
@@ -3518,29 +3899,36 @@ mod tests {
         let _ = task.await;
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn device_room_change_automation_executes_on_room_assignment() {
+    #[tokio::test]
+    async fn conditions_block_actions_until_all_filters_pass() {
         let dir = temp_dir("smart-home-automations");
         write_automation(
             &dir,
-            "room.lua",
+            "condition.lua",
             r#"return {
-                id = "room_assignment",
-                name = "Room Assignment",
+                id = "condition_gate",
+                name = "Condition Gate",
                 trigger = {
-                    type = "device_room_change",
-                    device_id = "test:roomed",
-                    room_id = "outside",
+                    type = "device_state_change",
+                    device_id = "test:rain",
+                    attribute = "custom.test.rain",
+                    equals = true,
+                },
+                conditions = {
+                    {
+                        type = "device_state",
+                        device_id = "test:presence",
+                        attribute = "presence",
+                        equals = true,
+                    },
                 },
                 execute = function(ctx, event)
-                    if event.room_id == "outside" then
-                        ctx:command("test:device", {
-                            capability = "brightness",
-                            action = "set",
-                            value = 61,
-                        })
-                    end
-                end
+                    ctx:command("test:device", {
+                        capability = "brightness",
+                        action = "set",
+                        value = 61,
+                    })
+                end,
             }"#,
         );
 
@@ -3552,60 +3940,56 @@ mod tests {
         ));
         runtime
             .registry()
-            .upsert_room(sample_room("outside", "Outside"))
-            .await;
+            .upsert(sample_device("test:rain", false))
+            .await
+            .expect("sensor device exists");
         runtime
             .registry()
-            .upsert(sample_device("test:roomed", false))
+            .upsert(attribute_device(
+                "test:presence",
+                "occupancy",
+                AttributeValue::Text("unoccupied".to_string()),
+            ))
             .await
-            .expect("roomed device exists");
+            .expect("presence device exists");
+        let failed = evaluate_condition(
+            &Condition::DeviceState {
+                device_id: "test:presence".to_string(),
+                attribute: "occupancy".to_string(),
+                equals: Some(AttributeValue::Text("occupied".to_string())),
+                threshold: None,
+            },
+            runtime.as_ref(),
+            &AttributeValue::Null,
+            Utc::now(),
+            TriggerContext::default(),
+        )
+        .await;
+        assert!(failed.is_err());
+
         runtime
             .registry()
-            .upsert(target_device("test:device"))
+            .upsert(attribute_device(
+                "test:presence",
+                "occupancy",
+                AttributeValue::Text("occupied".to_string()),
+            ))
             .await
-            .expect("target device exists");
-
-        let catalog = AutomationCatalog::load_from_directory(&dir, None).expect("catalog loads");
-        let runner = AutomationRunner::new(catalog);
-        let task = tokio::spawn({
-            let runtime = runtime.clone();
-            async move {
-                runner.run(runtime).await;
-            }
-        });
-
-        sleep(Duration::from_millis(25)).await;
-
-        runtime
-            .registry()
-            .assign_device_to_room(
-                &DeviceId("test:roomed".to_string()),
-                Some(RoomId("outside".to_string())),
-            )
-            .await
-            .expect("room assignment succeeds");
-
-        timeout(Duration::from_secs(2), async {
-            loop {
-                if runtime
-                    .registry()
-                    .get(&DeviceId("test:device".to_string()))
-                    .expect("target device exists")
-                    .attributes
-                    .get("brightness")
-                    == Some(&AttributeValue::Integer(61))
-                {
-                    break;
-                }
-
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("device room change automation executes");
-
-        task.abort();
-        let _ = task.await;
+            .expect("presence update succeeds");
+        let passed = evaluate_condition(
+            &Condition::DeviceState {
+                device_id: "test:presence".to_string(),
+                attribute: "occupancy".to_string(),
+                equals: Some(AttributeValue::Text("occupied".to_string())),
+                threshold: None,
+            },
+            runtime.as_ref(),
+            &AttributeValue::Null,
+            Utc::now(),
+            TriggerContext::default(),
+        )
+        .await;
+        assert!(passed.is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4015,6 +4399,7 @@ mod tests {
                         ExecutionControl {
                             semaphore: Arc::new(Semaphore::new(1)),
                             timeout: Duration::from_secs(1),
+                            trigger_context: TriggerContext::default(),
                         },
                     )
                     .await;
@@ -4115,6 +4500,7 @@ mod tests {
             ExecutionControl {
                 semaphore: Arc::new(Semaphore::new(1)),
                 timeout: Duration::from_secs(1),
+                trigger_context: TriggerContext::default(),
             },
             2,
             None,
