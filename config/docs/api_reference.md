@@ -10,6 +10,16 @@ This comes from `api.bind_address` in `config/default.toml`.
 
 Replace `127.0.0.1:3000` in the examples below if you changed `api.bind_address`.
 
+Cross-origin browser clients are disabled by default. To allow external dashboards or other browser clients, configure explicit origins under `api.cors` in `config/default.toml`:
+
+```toml
+[api.cors]
+enabled = true
+allowed_origins = ["http://127.0.0.1:8080"]
+```
+
+Only bare `http` and `https` origins are accepted. Paths, queries, fragments, and wildcard origins are not supported.
+
 ## Conventions
 
 - request and response bodies are JSON unless stated otherwise

@@ -1,0 +1,544 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Smart Home Dashboard Template</title>
+    <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        --bg: #09111f;
+        --panel: rgba(10, 20, 36, 0.9);
+        --panel-border: rgba(148, 163, 184, 0.18);
+        --text: #e2e8f0;
+        --muted: #94a3b8;
+        --accent: #7dd3fc;
+        --good: #34d399;
+        --warn: #fbbf24;
+        --bad: #f87171;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background:
+          radial-gradient(circle at top, rgba(14, 165, 233, 0.18), transparent 30%),
+          linear-gradient(180deg, #020617 0%, var(--bg) 100%);
+        color: var(--text);
+      }
+
+      main {
+        max-width: 960px;
+        margin: 0 auto;
+        padding: 32px 20px 64px;
+      }
+
+      .hero {
+        display: grid;
+        gap: 8px;
+        margin-bottom: 24px;
+      }
+
+      .eyebrow {
+        margin: 0;
+        color: var(--accent);
+        font-size: 0.82rem;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(2rem, 6vw, 3.4rem);
+        line-height: 1;
+      }
+
+      .subtitle {
+        margin: 0;
+        color: var(--muted);
+        max-width: 52rem;
+        line-height: 1.6;
+      }
+
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--panel-border);
+        border-radius: 24px;
+        padding: 24px;
+        backdrop-filter: blur(14px);
+        box-shadow: 0 20px 60px rgba(2, 6, 23, 0.45);
+      }
+
+      .card-header {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: flex-start;
+        margin-bottom: 24px;
+      }
+
+      .card-title {
+        margin: 0;
+        font-size: 1.3rem;
+      }
+
+      .card-copy {
+        margin: 6px 0 0;
+        color: var(--muted);
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        border-radius: 999px;
+        font-size: 0.9rem;
+        border: 1px solid rgba(148, 163, 184, 0.2);
+        background: rgba(15, 23, 42, 0.7);
+        white-space: nowrap;
+      }
+
+      .badge::before {
+        content: "";
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: currentColor;
+      }
+
+      .status-live {
+        color: var(--good);
+      }
+
+      .status-connecting,
+      .status-reconnecting {
+        color: var(--warn);
+      }
+
+      .status-offline,
+      .status-error {
+        color: var(--bad);
+      }
+
+      .metrics {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 16px;
+      }
+
+      .metric {
+        padding: 18px;
+        border-radius: 18px;
+        background: rgba(15, 23, 42, 0.72);
+        border: 1px solid rgba(148, 163, 184, 0.12);
+      }
+
+      .metric-label {
+        margin: 0 0 12px;
+        color: var(--muted);
+        font-size: 0.92rem;
+      }
+
+      .metric-value {
+        margin: 0;
+        font-size: clamp(1.6rem, 5vw, 2.6rem);
+        line-height: 1;
+      }
+
+      .metric-unit {
+        display: inline-block;
+        margin-top: 8px;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+
+      .meta {
+        display: grid;
+        gap: 10px;
+        margin-top: 18px;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+
+      .config {
+        margin-top: 24px;
+        display: grid;
+        gap: 12px;
+      }
+
+      .config label {
+        display: grid;
+        gap: 8px;
+        color: var(--muted);
+      }
+
+      input {
+        width: 100%;
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        background: rgba(15, 23, 42, 0.8);
+        color: var(--text);
+        border-radius: 12px;
+        padding: 12px 14px;
+        font: inherit;
+      }
+
+      .actions {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      button {
+        border: 0;
+        border-radius: 12px;
+        padding: 11px 16px;
+        font: inherit;
+        cursor: pointer;
+        background: linear-gradient(135deg, #38bdf8, #0ea5e9);
+        color: #082f49;
+        font-weight: 700;
+      }
+
+      button.secondary {
+        background: rgba(15, 23, 42, 0.9);
+        color: var(--text);
+        border: 1px solid rgba(148, 163, 184, 0.16);
+      }
+
+      .hint {
+        margin: 0;
+        color: var(--muted);
+        font-size: 0.92rem;
+        line-height: 1.5;
+      }
+
+      code {
+        font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+        font-size: 0.92em;
+      }
+
+      @media (max-width: 720px) {
+        .card-header {
+          flex-direction: column;
+        }
+
+        .metrics {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main x-data="weatherDashboard()" x-init="init()">
+      <section class="hero">
+        <p class="eyebrow">Reference Template</p>
+        <h1>Smart Home Weather Dashboard</h1>
+        <p class="subtitle">
+          A tiny external dashboard template that consumes the Smart Home API through
+          filtered <code>GET /devices</code> requests and the live <code>/events</code> WebSocket.
+        </p>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <h2 class="card-title">Outside Weather</h2>
+            <p class="card-copy">Read-only view sourced from the <code>open_meteo</code> adapter.</p>
+          </div>
+          <span class="badge" :class="statusClass()" x-text="statusLabel()"></span>
+        </div>
+
+        <div class="metrics">
+          <article class="metric">
+            <p class="metric-label">Temperature</p>
+            <p class="metric-value" x-text="formatMeasurement(weather.temperature)"></p>
+            <span class="metric-unit" x-text="friendlyUnit(weather.temperature.unit)"></span>
+          </article>
+
+          <article class="metric">
+            <p class="metric-label">Wind Speed</p>
+            <p class="metric-value" x-text="formatMeasurement(weather.windSpeed)"></p>
+            <span class="metric-unit" x-text="friendlyUnit(weather.windSpeed.unit)"></span>
+          </article>
+
+          <article class="metric">
+            <p class="metric-label">Wind Direction</p>
+            <p class="metric-value" x-text="formatDirection(weather.windDirection.value)"></p>
+            <span class="metric-unit">degrees</span>
+          </article>
+        </div>
+
+        <div class="meta">
+          <div>API base: <code x-text="apiBase"></code></div>
+          <div>Last update: <span x-text="weather.lastUpdated || 'waiting for data' "></span></div>
+          <div x-show="errorMessage">Error: <span x-text="errorMessage"></span></div>
+        </div>
+      </section>
+
+      <section class="config">
+        <label>
+          API base URL
+          <input x-model="draftApiBase" type="text" placeholder="http://127.0.0.1:3001">
+        </label>
+
+        <div class="actions">
+          <button type="button" @click="applyApiBase()">Reconnect</button>
+          <button type="button" class="secondary" @click="loadWeather()">Refresh now</button>
+        </div>
+
+        <p class="hint">
+          Tip: when serving this file from a different origin, enable <code>api.cors</code> in
+          <code>config/default.toml</code> for the dashboard origin. For local testing, point it at
+          your API listener such as <code>http://127.0.0.1:3001</code>.
+        </p>
+      </section>
+    </main>
+
+    <script>
+      const WEATHER_DEVICE_IDS = [
+        "open_meteo:temperature_outdoor",
+        "open_meteo:wind_speed",
+        "open_meteo:wind_direction",
+      ];
+
+      function weatherDashboard() {
+        return {
+          apiBase: inferApiBase(),
+          draftApiBase: inferApiBase(),
+          socket: null,
+          reconnectTimer: null,
+          reconnectAttempt: 0,
+          connectionState: "connecting",
+          errorMessage: "",
+          weather: emptyWeatherState(),
+
+          async init() {
+            await this.loadWeather();
+            this.connectEvents();
+          },
+
+          async applyApiBase() {
+            this.apiBase = sanitizeBaseUrl(this.draftApiBase);
+            this.errorMessage = "";
+            this.weather = emptyWeatherState();
+            this.closeSocket();
+            await this.loadWeather();
+            this.connectEvents();
+          },
+
+          async loadWeather() {
+            try {
+              const response = await fetch(this.devicesUrl(), {
+                headers: { Accept: "application/json" },
+              });
+
+              if (!response.ok) {
+                throw new Error(`device request failed with ${response.status}`);
+              }
+
+              const devices = await response.json();
+              devices.forEach((device) => this.applyDevice(device));
+              this.errorMessage = "";
+            } catch (error) {
+              this.errorMessage = error.message;
+              if (this.connectionState === "live") {
+                this.connectionState = "error";
+              }
+            }
+          },
+
+          connectEvents() {
+            const socketUrl = toWebSocketUrl(this.apiBase, "/events");
+            this.connectionState = this.reconnectAttempt > 0 ? "reconnecting" : "connecting";
+            this.socket = new WebSocket(socketUrl);
+
+            this.socket.onopen = () => {
+              this.connectionState = "live";
+              this.reconnectAttempt = 0;
+              this.errorMessage = "";
+            };
+
+            this.socket.onmessage = (event) => {
+              try {
+                const payload = JSON.parse(event.data);
+                if (payload.type === "device.state_changed" && WEATHER_DEVICE_IDS.includes(payload.id)) {
+                  this.applyDevice({
+                    id: payload.id,
+                    attributes: payload.state,
+                    updated_at: new Date().toISOString(),
+                    last_seen: new Date().toISOString(),
+                  });
+                }
+
+                if (payload.type === "system.error") {
+                  this.errorMessage = payload.message || "system error";
+                }
+              } catch (error) {
+                this.errorMessage = `event parse failed: ${error.message}`;
+              }
+            };
+
+            this.socket.onerror = () => {
+              this.connectionState = "error";
+            };
+
+            this.socket.onclose = () => {
+              if (this.connectionState !== "error") {
+                this.connectionState = "offline";
+              }
+              this.scheduleReconnect();
+            };
+          },
+
+          scheduleReconnect() {
+            this.closeSocket();
+            clearTimeout(this.reconnectTimer);
+            this.reconnectAttempt += 1;
+            const delayMs = Math.min(1000 * 2 ** Math.min(this.reconnectAttempt, 4), 15000);
+            this.reconnectTimer = setTimeout(async () => {
+              await this.loadWeather();
+              this.connectEvents();
+            }, delayMs);
+          },
+
+          closeSocket() {
+            if (this.socket) {
+              this.socket.onclose = null;
+              this.socket.close();
+              this.socket = null;
+            }
+          },
+
+          devicesUrl() {
+            const query = WEATHER_DEVICE_IDS.map((id) => `ids=${encodeURIComponent(id)}`).join("&");
+            return `${sanitizeBaseUrl(this.apiBase)}/devices?${query}`;
+          },
+
+          applyDevice(device) {
+            const updatedAt = device.last_seen || device.updated_at || null;
+            if (updatedAt) {
+              this.weather.lastUpdated = formatTimestamp(updatedAt);
+            }
+
+            if (device.id === "open_meteo:temperature_outdoor") {
+              const measurement = readMeasurement(device.attributes, "temperature_outdoor");
+              if (measurement) {
+                this.weather.temperature = measurement;
+              }
+            }
+
+            if (device.id === "open_meteo:wind_speed") {
+              const measurement = readMeasurement(device.attributes, "wind_speed");
+              if (measurement) {
+                this.weather.windSpeed = measurement;
+              }
+            }
+
+            if (device.id === "open_meteo:wind_direction") {
+              const value = device.attributes && device.attributes.wind_direction;
+              if (typeof value === "number") {
+                this.weather.windDirection.value = value;
+              }
+            }
+          },
+
+          formatMeasurement(measurement) {
+            if (measurement.value === null || measurement.value === undefined) {
+              return "--";
+            }
+            return Number(measurement.value).toFixed(1);
+          },
+
+          friendlyUnit(unit) {
+            if (!unit) {
+              return "";
+            }
+            const units = {
+              celsius: "degrees Celsius",
+              "km/h": "kilometres per hour",
+            };
+            return units[unit] || unit;
+          },
+
+          formatDirection(value) {
+            if (value === null || value === undefined) {
+              return "--";
+            }
+            return `${Math.round(value)}°`;
+          },
+
+          statusClass() {
+            return `status-${this.connectionState}`;
+          },
+
+          statusLabel() {
+            const labels = {
+              connecting: "Connecting",
+              reconnecting: "Reconnecting",
+              live: "Live",
+              offline: "Offline",
+              error: "Error",
+            };
+            return labels[this.connectionState] || "Unknown";
+          },
+        };
+      }
+
+      function emptyWeatherState() {
+        return {
+          temperature: { value: null, unit: "celsius" },
+          windSpeed: { value: null, unit: "km/h" },
+          windDirection: { value: null },
+          lastUpdated: null,
+        };
+      }
+
+      function readMeasurement(attributes, key) {
+        const measurement = attributes && attributes[key];
+        if (!measurement || typeof measurement !== "object") {
+          return null;
+        }
+
+        return {
+          value: typeof measurement.value === "number" ? measurement.value : null,
+          unit: typeof measurement.unit === "string" ? measurement.unit : "",
+        };
+      }
+
+      function inferApiBase() {
+        const fromQuery = new URLSearchParams(window.location.search).get("api");
+        if (fromQuery) {
+          return sanitizeBaseUrl(fromQuery);
+        }
+
+        if (["127.0.0.1", "localhost"].includes(window.location.hostname)) {
+          return `${window.location.protocol}//127.0.0.1:3001`;
+        }
+
+        return `${window.location.protocol}//${window.location.host}`;
+      }
+
+      function sanitizeBaseUrl(url) {
+        return (url || "").trim().replace(/\/$/, "");
+      }
+
+      function toWebSocketUrl(baseUrl, path) {
+        const url = new URL(sanitizeBaseUrl(baseUrl) + path);
+        url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+        return url.toString();
+      }
+
+      function formatTimestamp(timestamp) {
+        return new Date(timestamp).toLocaleString();
+      }
+    </script>
+  </body>
+</html>

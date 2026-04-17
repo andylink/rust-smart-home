@@ -36,6 +36,7 @@ use smart_home_core::store::{
 };
 use smart_home_scenes::{SceneCatalog, SceneExecutionResult, SceneSummary};
 use store_sql::{HistorySelection, SqliteDeviceStore, SqliteHistoryConfig};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::Level;
 
 #[derive(Clone, Debug, Serialize)]
@@ -627,16 +628,19 @@ async fn main() -> Result<()> {
     };
     let automation_control = Arc::new(automation_runner.controller());
 
-    let app = app(AppState {
-        runtime: runtime.clone(),
-        scenes,
-        automations: automations.clone(),
-        automation_control: automation_control.clone(),
-        trigger_context,
-        health: health.clone(),
-        store: device_store.clone(),
-        history: HistorySettings::from_config(&config),
-    });
+    let app = app(
+        AppState {
+            runtime: runtime.clone(),
+            scenes,
+            automations: automations.clone(),
+            automation_control: automation_control.clone(),
+            trigger_context,
+            health: health.clone(),
+            store: device_store.clone(),
+            history: HistorySettings::from_config(&config),
+        },
+        &config,
+    );
     let listener = tokio::net::TcpListener::bind(&config.api.bind_address)
         .await
         .with_context(|| format!("failed to bind API listener on {}", config.api.bind_address))?;
@@ -1066,7 +1070,7 @@ async fn reconcile_device_store(
     Ok(())
 }
 
-fn app(state: AppState) -> Router {
+fn app(state: AppState, config: &Config) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -1103,7 +1107,31 @@ fn app(state: AppState) -> Router {
         .route("/devices/{id}/room", post(assign_device_room))
         .route("/devices/{id}/command", post(command_device))
         .route("/events", get(events))
+        .layer(cors_layer(config))
         .with_state(state)
+}
+
+fn cors_layer(config: &Config) -> CorsLayer {
+    if !config.api.cors.enabled {
+        return CorsLayer::new();
+    }
+
+    let allowed_origins = config
+        .api
+        .cors
+        .allowed_origins
+        .iter()
+        .map(|origin| {
+            origin
+                .parse()
+                .expect("validated CORS origin parses as header value")
+        })
+        .collect::<Vec<_>>();
+
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(allowed_origins))
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any)
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -2538,6 +2566,7 @@ mod tests {
             },
             api: smart_home_core::config::ApiConfig {
                 bind_address: "127.0.0.1:3001".to_string(),
+                cors: smart_home_core::config::ApiCorsConfig::default(),
             },
             locale: smart_home_core::config::LocaleConfig::default(),
             logging: smart_home_core::config::LoggingConfig {
@@ -2568,6 +2597,44 @@ mod tests {
             default_limit: 200,
             max_limit: 1000,
         }
+    }
+
+    async fn spawn_test_server_with_config(
+        runtime: Arc<Runtime>,
+        config: Config,
+    ) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        let automations = Arc::new(AutomationCatalog::empty());
+        let app = app(
+            AppState {
+                runtime,
+                scenes: empty_scenes(),
+                automations: automations.clone(),
+                automation_control: Arc::new(
+                    AutomationRunner::new((*automations).clone()).controller(),
+                ),
+                trigger_context: TriggerContext::default(),
+                health: test_health(&["open_meteo"]),
+                store: None,
+                history: history_settings(false),
+            },
+            &config,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("read test listener address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("test server exits cleanly");
+        });
+
+        (addr, shutdown_tx, handle)
     }
 
     #[test]
@@ -2652,18 +2719,22 @@ mod tests {
         runtime: Arc<Runtime>,
     ) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
         let automations = Arc::new(AutomationCatalog::empty());
-        let app = app(AppState {
-            runtime,
-            scenes: empty_scenes(),
-            automations: automations.clone(),
-            automation_control: Arc::new(
-                AutomationRunner::new((*automations).clone()).controller(),
-            ),
-            trigger_context: TriggerContext::default(),
-            health: test_health(&["open_meteo"]),
-            store: None,
-            history: history_settings(false),
-        });
+        let config = test_config(serde_json::Map::new());
+        let app = app(
+            AppState {
+                runtime,
+                scenes: empty_scenes(),
+                automations: automations.clone(),
+                automation_control: Arc::new(
+                    AutomationRunner::new((*automations).clone()).controller(),
+                ),
+                trigger_context: TriggerContext::default(),
+                health: test_health(&["open_meteo"]),
+                store: None,
+                history: history_settings(false),
+            },
+            &config,
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test listener");
@@ -2687,18 +2758,22 @@ mod tests {
         scenes: Arc<SceneCatalog>,
     ) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
         let automations = Arc::new(AutomationCatalog::empty());
-        let app = app(AppState {
-            runtime,
-            scenes,
-            automations: automations.clone(),
-            automation_control: Arc::new(
-                AutomationRunner::new((*automations).clone()).controller(),
-            ),
-            trigger_context: TriggerContext::default(),
-            health: test_health(&["open_meteo"]),
-            store: None,
-            history: history_settings(false),
-        });
+        let config = test_config(serde_json::Map::new());
+        let app = app(
+            AppState {
+                runtime,
+                scenes,
+                automations: automations.clone(),
+                automation_control: Arc::new(
+                    AutomationRunner::new((*automations).clone()).controller(),
+                ),
+                trigger_context: TriggerContext::default(),
+                health: test_health(&["open_meteo"]),
+                store: None,
+                history: history_settings(false),
+            },
+            &config,
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test listener");
@@ -2723,18 +2798,22 @@ mod tests {
         history_enabled: bool,
     ) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
         let automations = Arc::new(AutomationCatalog::empty());
-        let app = app(AppState {
-            runtime,
-            scenes: empty_scenes(),
-            automations: automations.clone(),
-            automation_control: Arc::new(
-                AutomationRunner::new((*automations).clone()).controller(),
-            ),
-            trigger_context: TriggerContext::default(),
-            health: test_health(&["open_meteo"]),
-            store: Some(store),
-            history: history_settings(history_enabled),
-        });
+        let config = test_config(serde_json::Map::new());
+        let app = app(
+            AppState {
+                runtime,
+                scenes: empty_scenes(),
+                automations: automations.clone(),
+                automation_control: Arc::new(
+                    AutomationRunner::new((*automations).clone()).controller(),
+                ),
+                trigger_context: TriggerContext::default(),
+                health: test_health(&["open_meteo"]),
+                store: Some(store),
+                history: history_settings(history_enabled),
+            },
+            &config,
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test listener");
@@ -2888,6 +2967,84 @@ mod tests {
         let body = response.json::<Value>().await.expect("devices JSON body");
         assert_eq!(body.as_array().expect("devices array").len(), 1);
         assert_eq!(body[0]["id"], Value::String("test:device".to_string()));
+
+        let _ = shutdown.send(());
+        handle.await.expect("server task completes");
+    }
+
+    #[tokio::test]
+    async fn cors_allows_configured_origin_on_regular_request() {
+        let runtime = Arc::new(Runtime::new(
+            Vec::new(),
+            RuntimeConfig {
+                event_bus_capacity: 16,
+            },
+        ));
+        let mut config = test_config(serde_json::Map::new());
+        config.api.cors.enabled = true;
+        config.api.cors.allowed_origins = vec!["http://127.0.0.1:8080".to_string()];
+        let (addr, shutdown, handle) = spawn_test_server_with_config(runtime, config).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/devices"))
+            .header("Origin", "http://127.0.0.1:8080")
+            .send()
+            .await
+            .expect("cors request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .expect("allow origin header present"),
+            "http://127.0.0.1:8080"
+        );
+
+        let _ = shutdown.send(());
+        handle.await.expect("server task completes");
+    }
+
+    #[tokio::test]
+    async fn cors_rejects_disallowed_origin_and_handles_preflight_for_allowed_origin() {
+        let runtime = Arc::new(Runtime::new(
+            Vec::new(),
+            RuntimeConfig {
+                event_bus_capacity: 16,
+            },
+        ));
+        let mut config = test_config(serde_json::Map::new());
+        config.api.cors.enabled = true;
+        config.api.cors.allowed_origins = vec!["http://127.0.0.1:8080".to_string()];
+        let (addr, shutdown, handle) = spawn_test_server_with_config(runtime, config).await;
+
+        let denied = reqwest::Client::new()
+            .get(format!("http://{addr}/devices"))
+            .header("Origin", "http://evil.example")
+            .send()
+            .await
+            .expect("disallowed origin request succeeds");
+        assert!(denied
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none());
+
+        let preflight = reqwest::Client::new()
+            .request(reqwest::Method::OPTIONS, format!("http://{addr}/devices"))
+            .header("Origin", "http://127.0.0.1:8080")
+            .header("Access-Control-Request-Method", "GET")
+            .send()
+            .await
+            .expect("preflight request succeeds");
+
+        assert_eq!(preflight.status(), StatusCode::OK);
+        assert_eq!(
+            preflight
+                .headers()
+                .get("access-control-allow-origin")
+                .expect("preflight allow origin header present"),
+            "http://127.0.0.1:8080"
+        );
 
         let _ = shutdown.send(());
         handle.await.expect("server task completes");
@@ -3231,16 +3388,20 @@ mod tests {
         );
         let automation_control =
             Arc::new(AutomationRunner::new((*automations).clone()).controller());
-        let app = app(AppState {
-            runtime,
-            scenes: empty_scenes(),
-            automations,
-            automation_control,
-            trigger_context: TriggerContext::default(),
-            health: test_health(&["open_meteo"]),
-            store: None,
-            history: history_settings(false),
-        });
+        let config = test_config(serde_json::Map::new());
+        let app = app(
+            AppState {
+                runtime,
+                scenes: empty_scenes(),
+                automations,
+                automation_control,
+                trigger_context: TriggerContext::default(),
+                health: test_health(&["open_meteo"]),
+                store: None,
+                history: history_settings(false),
+            },
+            &config,
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test listener");
@@ -3360,16 +3521,20 @@ mod tests {
             .await
             .expect("presence exists");
 
-        let app = app(AppState {
-            runtime: runtime.clone(),
-            scenes: empty_scenes(),
-            automations,
-            automation_control,
-            trigger_context: TriggerContext::default(),
-            health: test_health(&["open_meteo"]),
-            store: None,
-            history: history_settings(false),
-        });
+        let config = test_config(serde_json::Map::new());
+        let app = app(
+            AppState {
+                runtime: runtime.clone(),
+                scenes: empty_scenes(),
+                automations,
+                automation_control,
+                trigger_context: TriggerContext::default(),
+                health: test_health(&["open_meteo"]),
+                store: None,
+                history: history_settings(false),
+            },
+            &config,
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test listener");
@@ -3601,18 +3766,22 @@ mod tests {
         let health = test_health(&["open_meteo"]);
         health.adapter_error("open_meteo", "open_meteo poll failed: timeout");
 
-        let app = app(AppState {
-            runtime,
-            scenes: empty_scenes(),
-            automations: Arc::new(AutomationCatalog::empty()),
-            automation_control: Arc::new(
-                AutomationRunner::new(AutomationCatalog::empty()).controller(),
-            ),
-            trigger_context: TriggerContext::default(),
-            health,
-            store: None,
-            history: history_settings(false),
-        });
+        let config = test_config(serde_json::Map::new());
+        let app = app(
+            AppState {
+                runtime,
+                scenes: empty_scenes(),
+                automations: Arc::new(AutomationCatalog::empty()),
+                automation_control: Arc::new(
+                    AutomationRunner::new(AutomationCatalog::empty()).controller(),
+                ),
+                trigger_context: TriggerContext::default(),
+                health,
+                store: None,
+                history: history_settings(false),
+            },
+            &config,
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test listener");
@@ -4027,18 +4196,22 @@ mod tests {
         let scenes =
             Arc::new(SceneCatalog::load_from_directory(&scene_dir, None).expect("scenes load"));
 
-        let app = app(AppState {
-            runtime: runtime.clone(),
-            scenes,
-            automations: Arc::new(AutomationCatalog::empty()),
-            automation_control: Arc::new(
-                AutomationRunner::new(AutomationCatalog::empty()).controller(),
-            ),
-            trigger_context: TriggerContext::default(),
-            health: test_health(&["open_meteo"]),
-            store: Some(store.clone()),
-            history: history_settings(true),
-        });
+        let config = test_config(serde_json::Map::new());
+        let app = app(
+            AppState {
+                runtime: runtime.clone(),
+                scenes,
+                automations: Arc::new(AutomationCatalog::empty()),
+                automation_control: Arc::new(
+                    AutomationRunner::new(AutomationCatalog::empty()).controller(),
+                ),
+                trigger_context: TriggerContext::default(),
+                health: test_health(&["open_meteo"]),
+                store: Some(store.clone()),
+                history: history_settings(true),
+            },
+            &config,
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test listener");
@@ -4795,6 +4968,7 @@ mod tests {
             },
             api: smart_home_core::config::ApiConfig {
                 bind_address: "127.0.0.1:3001".to_string(),
+                cors: smart_home_core::config::ApiCorsConfig::default(),
             },
             locale: smart_home_core::config::LocaleConfig::default(),
             logging: smart_home_core::config::LoggingConfig {

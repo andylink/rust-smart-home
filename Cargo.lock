@@ -143,6 +143,7 @@ dependencies = [
  "store-sql",
  "tokio",
  "tokio-tungstenite 0.28.0",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -2301,6 +2302,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

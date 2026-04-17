@@ -17,6 +17,7 @@ Start here depending on your goal:
 
 - run the system: `config/default.toml`
 - use the API: `config/docs/api_reference.md`
+- build an external dashboard template: `config/docs/dashboard_template_guide.md`
 - write Lua scenes and automations: `config/docs/lua_runtime_guide.md`
 - build a new adapter: `config/docs/adapter_authoring_guide.md`
 - operate as an agent in this repo: `config/docs/agent_workflows.md`
@@ -29,6 +30,10 @@ Adapter-specific docs:
 - `crates/adapter-elgato-lights/README.md`
 - `crates/adapter-ollama/README.md`
 - `crates/adapter-roku-tv/README.md`
+
+External reference examples:
+
+- `examples/dashboard-template/README.md`
 
 Lua runtime docs:
 

@@ -1333,6 +1333,8 @@ fn config_loads_default_toml() {
     assert_eq!(config.persistence.history.retention_days, Some(30));
     assert_eq!(config.persistence.history.default_query_limit, 200);
     assert_eq!(config.persistence.history.max_query_limit, 1000);
+    assert!(!config.api.cors.enabled);
+    assert!(config.api.cors.allowed_origins.is_empty());
     assert!(!config.telemetry.enabled);
     assert!(config.telemetry.selection.device_ids.is_empty());
     let open_meteo = config
@@ -1414,5 +1416,83 @@ poll_interval_secs = 90
     assert_eq!(
         error.to_string(),
         "persistence.database_url is required when persistence is enabled"
+    );
+}
+
+#[test]
+fn config_rejects_enabled_cors_without_allowed_origins() {
+    let path = write_temp_config(
+        r#"
+[runtime]
+event_bus_capacity = 1024
+
+[api.cors]
+enabled = true
+
+[logging]
+level = "info"
+"#,
+    );
+
+    let error = Config::load_from_file(&path).expect_err("missing cors origins should fail");
+    let _ = fs::remove_file(&path);
+
+    assert_eq!(
+        error.to_string(),
+        "api.cors.allowed_origins must not be empty when api.cors.enabled is true"
+    );
+}
+
+#[test]
+fn config_rejects_cors_origin_with_path() {
+    let path = write_temp_config(
+        r#"
+[runtime]
+event_bus_capacity = 1024
+
+[api.cors]
+enabled = true
+allowed_origins = ["http://127.0.0.1:8080/dashboard"]
+
+[logging]
+level = "info"
+"#,
+    );
+
+    let error = Config::load_from_file(&path).expect_err("cors origin with path should fail");
+    let _ = fs::remove_file(&path);
+
+    assert_eq!(
+        error.to_string(),
+        "api.cors.allowed_origins must be bare origins without path, query, or fragment: 'http://127.0.0.1:8080/dashboard'"
+    );
+}
+
+#[test]
+fn config_accepts_enabled_cors_with_explicit_origins() {
+    let path = write_temp_config(
+        r#"
+[runtime]
+event_bus_capacity = 1024
+
+[api.cors]
+enabled = true
+allowed_origins = ["http://127.0.0.1:8080", "http://localhost:8080"]
+
+[logging]
+level = "info"
+"#,
+    );
+
+    let config = Config::load_from_file(&path).expect("valid cors config should load");
+    let _ = fs::remove_file(&path);
+
+    assert!(config.api.cors.enabled);
+    assert_eq!(
+        config.api.cors.allowed_origins,
+        vec![
+            "http://127.0.0.1:8080".to_string(),
+            "http://localhost:8080".to_string()
+        ]
     );
 }

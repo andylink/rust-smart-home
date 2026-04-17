@@ -41,6 +41,15 @@ pub struct LoggingConfig {
 pub struct ApiConfig {
     #[serde(default = "default_api_bind_address")]
     pub bind_address: String,
+    #[serde(default)]
+    pub cors: ApiCorsConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ApiCorsConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,6 +117,7 @@ impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             bind_address: default_api_bind_address(),
+            cors: ApiCorsConfig::default(),
         }
     }
 }
@@ -200,6 +210,51 @@ impl Config {
     fn validate(&self) -> Result<()> {
         if self.api.bind_address.trim().is_empty() {
             bail!("api.bind_address is required");
+        }
+
+        if self.api.cors.enabled {
+            if self.api.cors.allowed_origins.is_empty() {
+                bail!("api.cors.allowed_origins must not be empty when api.cors.enabled is true");
+            }
+
+            for origin in &self.api.cors.allowed_origins {
+                if origin.trim().is_empty() {
+                    bail!("api.cors.allowed_origins must not contain empty origins");
+                }
+
+                let parsed = url::Url::parse(origin).map_err(|error| {
+                    anyhow!(
+                        "api.cors.allowed_origins contains invalid origin '{}': {}",
+                        origin,
+                        error
+                    )
+                })?;
+
+                match parsed.scheme() {
+                    "http" | "https" => {}
+                    scheme => {
+                        bail!(
+                            "api.cors.allowed_origins contains unsupported scheme '{}' in '{}'",
+                            scheme,
+                            origin
+                        );
+                    }
+                }
+
+                if parsed.host_str().is_none() {
+                    bail!(
+                        "api.cors.allowed_origins must include a host component: '{}'",
+                        origin
+                    );
+                }
+
+                if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+                    bail!(
+                        "api.cors.allowed_origins must be bare origins without path, query, or fragment: '{}'",
+                        origin
+                    );
+                }
+            }
         }
 
         if self.persistence.enabled
