@@ -50,17 +50,17 @@ Status legend: `[ ]` pending · `[~]` in progress · `[x]` done
   - `GET    /auth/keys`       — list all keys (hashes redacted)
   - `DELETE /auth/keys/{id}`  — revoke a key
 - [x] Apply role enforcement to existing endpoints
-- [ ] Add auth section to OpenAPI spec (`config/docs/openapi.yaml`)
+- [x] Add auth section to OpenAPI spec (`config/docs/openapi.yaml`)
 - [x] Update AGENTS.md with auth notes
 - [x] Add tests: unauthenticated requests rejected, roles enforced, master key accepted
 
 ### 1.4 Deployment packaging
-- [ ] `Dockerfile` — multi-stage build (rust builder → slim runtime)
+- [x] `Dockerfile` — multi-stage build (rust builder → slim runtime)
   - `/config` and `/data` as volumes (Lua files editable outside container)
   - `SMART_HOME_CONFIG` and `SMART_HOME_DATA_DIR` set via environment
-- [ ] `docker-compose.yml` — single-service compose for home server deployment
-- [ ] `deploy/smart-home.service` — systemd unit file for bare-metal install
-- [ ] `docs/deployment.md` — install guide covering Docker, bare metal, and dev instance
+- [x] `docker-compose.yml` — single-service compose for home server deployment
+- [x] `deploy/smart-home.service` — systemd unit file for bare-metal install
+- [x] `docs/deployment.md` — install guide covering Docker, bare metal, and dev instance
   - Dev instance: separate port, DB file, MQTT client ID — no code changes required
 
 ---

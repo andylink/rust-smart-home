@@ -1,0 +1,24 @@
+services:
+  smart-home:
+    build: .
+    image: smart-home:latest
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    volumes:
+      # Bind-mount your local config directory into the container.
+      # Place default.toml, scenes/, automations/, and scripts/ here.
+      - ./config:/config:ro
+      # Persistent data directory — holds the SQLite database.
+      - smart-home-data:/data
+    environment:
+      SMART_HOME_CONFIG: /config/default.toml
+      SMART_HOME_DATA_DIR: /data
+      # Override the master key here or inject from a .env file.
+      # SMART_HOME_MASTER_KEY: change-me-before-use
+    # Uncomment to forward host MQTT broker (zigbee2mqtt default port).
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+
+volumes:
+  smart-home-data:
