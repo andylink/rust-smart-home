@@ -571,6 +571,39 @@ async fn removing_device_prunes_group_membership() {
 }
 
 #[tokio::test]
+async fn restore_groups_prunes_members_whose_devices_no_longer_exist() {
+    let bus = EventBus::new(16);
+    let registry = DeviceRegistry::new(bus);
+
+    // Restore one live device.
+    let live = sample_device(
+        "test:live",
+        TEMPERATURE_OUTDOOR,
+        measurement_value(22.0, "celsius"),
+    );
+    registry
+        .restore(vec![live.clone()])
+        .expect("device restore succeeds");
+
+    // Restore a group whose membership includes the live device and a
+    // stale device that no longer exists in the store.
+    registry.restore_groups(vec![DeviceGroup {
+        id: GroupId("mixed_group".to_string()),
+        name: "Mixed Group".to_string(),
+        members: vec![live.id.clone(), DeviceId("test:stale".to_string())],
+    }]);
+
+    let group = registry
+        .get_group(&GroupId("mixed_group".to_string()))
+        .expect("group is present after restore");
+    assert_eq!(
+        group.members,
+        vec![live.id],
+        "stale member should be pruned; live member should remain"
+    );
+}
+
+#[tokio::test]
 async fn upserting_device_with_unknown_room_is_rejected() {
     let bus = EventBus::new(16);
     let registry = DeviceRegistry::new(bus);
@@ -952,6 +985,7 @@ fn device_command_accepts_lock_action_without_value() {
         capability: LOCK.to_string(),
         action: "lock".to_string(),
         value: None,
+        transition_secs: None,
     }
     .validate()
     .expect("lock command should validate");
@@ -963,6 +997,7 @@ fn device_command_accepts_media_source_set_with_value() {
         capability: MEDIA_SOURCE.to_string(),
         action: "set".to_string(),
         value: Some(AttributeValue::Text("hdmi2".to_string())),
+        transition_secs: None,
     }
     .validate()
     .expect("media source set command should validate");
@@ -974,6 +1009,7 @@ fn device_command_rejects_reset_with_value() {
         capability: ENERGY_TOTAL.to_string(),
         action: "reset".to_string(),
         value: Some(AttributeValue::Integer(0)),
+        transition_secs: None,
     }
     .validate()
     .err()
@@ -1248,6 +1284,7 @@ fn device_command_validates_power_toggle_without_value() {
         capability: POWER.to_string(),
         action: "toggle".to_string(),
         value: None,
+        transition_secs: None,
     }
     .validate()
     .expect("power toggle command should validate");
@@ -1259,6 +1296,7 @@ fn device_command_rejects_set_without_value() {
         capability: BRIGHTNESS.to_string(),
         action: "set".to_string(),
         value: None,
+        transition_secs: None,
     }
     .validate()
     .err()
@@ -1276,6 +1314,7 @@ fn device_command_rejects_value_for_power_on() {
         capability: POWER.to_string(),
         action: "on".to_string(),
         value: Some(AttributeValue::Text("on".to_string())),
+        transition_secs: None,
     }
     .validate()
     .err()
@@ -1299,6 +1338,7 @@ fn device_command_accepts_kelvin_7000() {
                 AttributeValue::Text("kelvin".to_string()),
             ),
         ]))),
+        transition_secs: None,
     }
     .validate()
     .expect("7000 kelvin should validate");

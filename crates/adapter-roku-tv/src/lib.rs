@@ -833,6 +833,7 @@ mod tests {
                     capability: POWER.to_string(),
                     action: "off".to_string(),
                     value: None,
+                    transition_secs: None,
                 },
                 registry.clone(),
             )
@@ -926,6 +927,7 @@ mod tests {
                     capability: MEDIA_APP.to_string(),
                     action: "set".to_string(),
                     value: Some(AttributeValue::Text("Plex".to_string())),
+                    transition_secs: None,
                 },
                 registry.clone(),
             )
@@ -1017,6 +1019,7 @@ mod tests {
                     capability: MEDIA_SOURCE.to_string(),
                     action: "set".to_string(),
                     value: Some(AttributeValue::Text("hdmi1".to_string())),
+                    transition_secs: None,
                 },
                 registry.clone(),
             )

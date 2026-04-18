@@ -11,6 +11,14 @@ pub struct DeviceCommand {
     pub action: String,
     #[serde(default)]
     pub value: Option<AttributeValue>,
+    /// Optional hardware transition duration in seconds.
+    ///
+    /// Adapters that support smooth transitions (e.g. Zigbee2MQTT) will pass this
+    /// to the device firmware.  Adapters that do not support it silently ignore it.
+    /// When set, the command returns immediately after dispatch — the caller is
+    /// responsible for waiting (e.g. `ctx:sleep`) while the hardware fades.
+    #[serde(default)]
+    pub transition_secs: Option<f64>,
 }
 
 impl DeviceCommand {

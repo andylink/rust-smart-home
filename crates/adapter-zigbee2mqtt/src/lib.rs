@@ -328,6 +328,13 @@ impl Zigbee2MqttAdapter {
             .await
             .with_context(|| format!("failed to publish command to '{topic}'"))?;
 
+        // Transition commands are handled entirely in device firmware — the bulb
+        // fades on its own schedule.  Return immediately so the caller (e.g. a Lua
+        // scene using ctx:sleep) can own the timing without racing the confirmation.
+        if command.transition_secs.is_some() {
+            return Ok(true);
+        }
+
         let device_id = discovered.device_id.clone();
         let confirmation: Result<()> = timeout(self.command_timeout, async move {
             loop {
@@ -1174,14 +1181,14 @@ fn build_metadata(discovered: &DiscoveredDevice, object: &Map<String, Value>) ->
 }
 
 fn build_command_payload(discovered: &DiscoveredDevice, command: &DeviceCommand) -> Result<Value> {
-    match (
+    let mut payload = match (
         discovered.device_kind,
         command.capability.as_str(),
         command.action.as_str(),
     ) {
-        (_, POWER, "on") => Ok(serde_json::json!({ "state": "ON" })),
-        (_, POWER, "off") => Ok(serde_json::json!({ "state": "OFF" })),
-        (_, POWER, "toggle") => Ok(serde_json::json!({ "state": "TOGGLE" })),
+        (_, POWER, "on") => serde_json::json!({ "state": "ON" }),
+        (_, POWER, "off") => serde_json::json!({ "state": "OFF" }),
+        (_, POWER, "toggle") => serde_json::json!({ "state": "TOGGLE" }),
         (SupportedDeviceKind::Light, BRIGHTNESS, "set") => {
             let percent = command
                 .value
@@ -1191,22 +1198,35 @@ fn build_command_payload(discovered: &DiscoveredDevice, command: &DeviceCommand)
                     _ => None,
                 })
                 .context("brightness command requires integer value")?;
-            Ok(serde_json::json!({ "brightness": scale_percent_to_brightness(percent) }))
+            serde_json::json!({ "brightness": scale_percent_to_brightness(percent) })
         }
         (SupportedDeviceKind::Light, COLOR_XY, "set") => {
             let (x, y) = parse_xy_command_value(command.value.as_ref())?;
-            Ok(serde_json::json!({ "color": { "x": x, "y": y } }))
+            serde_json::json!({ "color": { "x": x, "y": y } })
         }
         (SupportedDeviceKind::Light, COLOR_TEMPERATURE, "set") => {
             let mireds = parse_color_temperature_mireds(command.value.as_ref())?;
-            Ok(serde_json::json!({ "color_temp": mireds }))
+            serde_json::json!({ "color_temp": mireds })
         }
         _ => bail!(
             "zigbee2mqtt does not support '{}' command for capability '{}'",
             command.action,
             command.capability
         ),
+    };
+
+    // Attach the hardware transition duration when requested.  Power commands
+    // do not benefit from a transition so we only add it for light-level changes.
+    if let (Some(secs), Some(obj)) = (command.transition_secs, payload.as_object_mut()) {
+        match command.capability.as_str() {
+            BRIGHTNESS | COLOR_XY | COLOR_TEMPERATURE => {
+                obj.insert("transition".to_string(), serde_json::json!(secs));
+            }
+            _ => {}
+        }
     }
+
+    Ok(payload)
 }
 
 fn expected_command_matcher(
@@ -1767,6 +1787,7 @@ mod tests {
                     capability: BRIGHTNESS.to_string(),
                     action: "set".to_string(),
                     value: Some(AttributeValue::Integer(50)),
+                    transition_secs: None,
                 },
                 registry,
             )
@@ -1819,6 +1840,7 @@ mod tests {
                             AttributeValue::Text("kelvin".to_string()),
                         ),
                     ]))),
+                    transition_secs: None,
                 },
                 registry,
             )
@@ -1995,5 +2017,44 @@ mod tests {
 
         assert_eq!(second.updated_at, first.updated_at);
         assert!(second.last_seen > first.last_seen);
+    }
+
+    #[tokio::test]
+    async fn command_with_transition_includes_transition_field_in_payload() {
+        let broker = Arc::new(FakeBroker::default());
+        let adapter = build_test_adapter(Arc::clone(&broker)).await;
+        let registry = DeviceRegistry::new(EventBus::new(16));
+
+        adapter
+            .process_message(
+                "zigbee2mqtt/bridge/devices",
+                bridge_devices_payload().to_string().as_bytes(),
+                &registry,
+            )
+            .await
+            .expect("bridge devices message applies");
+
+        // No event sender spawned — transition mode skips confirmation wait.
+        assert!(adapter
+            .command(
+                &DeviceId("zigbee2mqtt:living_room_bulb".to_string()),
+                DeviceCommand {
+                    capability: BRIGHTNESS.to_string(),
+                    action: "set".to_string(),
+                    value: Some(AttributeValue::Integer(0)),
+                    transition_secs: Some(10.0),
+                },
+                registry,
+            )
+            .await
+            .expect("command with transition succeeds"));
+
+        let published = broker.published.lock().await;
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].0, "zigbee2mqtt/living_room_bulb/set");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&published[0].1).expect("published payload parses"),
+            serde_json::json!({"brightness": 0, "transition": 10.0})
+        );
     }
 }

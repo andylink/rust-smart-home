@@ -672,6 +672,7 @@ mod tests {
                     AttributeValue::Text("kelvin".to_string()),
                 ),
             ]))),
+            transition_secs: None,
         };
 
         assert!(adapter
@@ -734,6 +735,7 @@ mod tests {
                             AttributeValue::Text("kelvin".to_string()),
                         ),
                     ]))),
+                    transition_secs: None,
                 },
                 registry,
             )
