@@ -29,6 +29,29 @@ Only bare `http` and `https` origins are accepted. Paths, queries, fragments, an
 
 ## Health
 
+### `GET /diagnostics/reload_watch`
+
+Returns current reload watch configuration for scenes, automations, and scripts.
+
+Example:
+
+```bash
+curl http://127.0.0.1:3000/diagnostics/reload_watch
+```
+
+Response shape:
+
+```json
+{
+  "status": "ok",
+  "watches": [
+    { "target": "scenes", "enabled": true, "directory": "config/scenes" },
+    { "target": "automations", "enabled": false, "directory": "config/automations" },
+    { "target": "scripts", "enabled": false, "directory": "config/scripts" }
+  ]
+}
+```
+
 ### `GET /health`
 
 Returns a simple health response.
@@ -90,6 +113,57 @@ Response shape:
 ]
 ```
 
+### `POST /scenes/reload`
+
+Reloads the scene catalog from the configured scenes directory.
+
+Behavior:
+
+- validates all scene files before activation
+- atomically swaps the active in-memory catalog on success
+- keeps the previous catalog active when any file fails validation
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:3000/scenes/reload
+```
+
+Success response:
+
+```json
+{
+  "status": "ok",
+  "target": "scenes",
+  "loaded_count": 12,
+  "errors": [],
+  "duration_ms": 9
+}
+```
+
+Failure response:
+
+```json
+{
+  "status": "error",
+  "target": "scenes",
+  "loaded_count": 0,
+  "errors": [
+    {
+      "file": "config/scenes/broken.lua",
+      "message": "scene file config/scenes/broken.lua is missing function field 'execute': ..."
+    }
+  ],
+  "duration_ms": 3
+}
+```
+
+Runtime events emitted over WebSocket `/events` during reload:
+
+- `scene.catalog_reload_started`
+- `scene.catalog_reloaded`
+- `scene.catalog_reload_failed`
+
 ### `POST /scenes/{id}/execute`
 
 Executes one loaded scene by ID.
@@ -126,6 +200,60 @@ Error behavior:
 Scene execution currently runs commands sequentially in the order the Lua scene emits them.
 
 ## Devices
+
+## Automations
+
+### `POST /automations/reload`
+
+Reloads the automation catalog from the configured automations directory.
+
+Behavior:
+
+- validates all automation files before activation
+- atomically swaps the active in-memory automation catalog on success
+- restarts trigger loops using the new catalog on success
+- preserves automation enabled/disabled toggles for unchanged automation IDs
+- keeps the previous catalog active when any file fails validation
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:3000/automations/reload
+```
+
+Response shape is the same as `POST /scenes/reload` with `target` set to `"automations"`.
+
+Runtime events emitted over WebSocket `/events` during reload:
+
+- `automation.catalog_reload_started`
+- `automation.catalog_reloaded`
+- `automation.catalog_reload_failed`
+
+## Scripts
+
+### `POST /scripts/reload`
+
+Acknowledges script directory changes for operator workflows and emits scripts reload lifecycle events.
+
+Behavior:
+
+- validates that the scripts directory is readable
+- emits scripts reload lifecycle events over `/events`
+- does not interrupt in-flight scene or automation executions
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:3000/scripts/reload
+```
+
+Response shape is the same as other reload endpoints with `target` set to `"scripts"`.
+
+Runtime events emitted over WebSocket `/events` during reload:
+
+- `scripts.reload_started`
+- `scripts.reloaded`
+- `scripts.reload_failed`
 
 ## Capabilities
 
