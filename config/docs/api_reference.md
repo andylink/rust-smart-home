@@ -29,6 +29,29 @@ Only bare `http` and `https` origins are accepted. Paths, queries, fragments, an
 
 ## Health
 
+### `GET /diagnostics/reload_watch`
+
+Returns current reload watch configuration for scenes, automations, and scripts.
+
+Example:
+
+```bash
+curl http://127.0.0.1:3000/diagnostics/reload_watch
+```
+
+Response shape:
+
+```json
+{
+  "status": "ok",
+  "watches": [
+    { "target": "scenes", "enabled": true, "directory": "config/scenes" },
+    { "target": "automations", "enabled": false, "directory": "config/automations" },
+    { "target": "scripts", "enabled": false, "directory": "config/scripts" }
+  ]
+}
+```
+
 ### `GET /health`
 
 Returns a simple health response.
@@ -205,6 +228,32 @@ Runtime events emitted over WebSocket `/events` during reload:
 - `automation.catalog_reload_started`
 - `automation.catalog_reloaded`
 - `automation.catalog_reload_failed`
+
+## Scripts
+
+### `POST /scripts/reload`
+
+Acknowledges script directory changes for operator workflows and emits scripts reload lifecycle events.
+
+Behavior:
+
+- validates that the scripts directory is readable
+- emits scripts reload lifecycle events over `/events`
+- does not interrupt in-flight scene or automation executions
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:3000/scripts/reload
+```
+
+Response shape is the same as other reload endpoints with `target` set to `"scripts"`.
+
+Runtime events emitted over WebSocket `/events` during reload:
+
+- `scripts.reload_started`
+- `scripts.reloaded`
+- `scripts.reload_failed`
 
 ## Capabilities
 

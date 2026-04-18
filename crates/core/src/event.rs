@@ -73,6 +73,15 @@ pub enum Event {
         duration_ms: u64,
         errors: Vec<ReloadError>,
     },
+    ScriptsReloadStarted,
+    ScriptsReloaded {
+        loaded_count: usize,
+        duration_ms: u64,
+    },
+    ScriptsReloadFailed {
+        duration_ms: u64,
+        errors: Vec<ReloadError>,
+    },
     SystemError {
         message: String,
     },

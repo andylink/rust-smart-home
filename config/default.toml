@@ -29,14 +29,17 @@ max_query_limit = 1000
 [scenes]
 enabled = true
 directory = "config/scenes"
+watch = false
 
 [automations]
 enabled = true
 directory = "config/automations"
+watch = false
 
 [scripts]
 enabled = true
 directory = "config/scripts"
+watch = false
 
 [telemetry]
 enabled = false

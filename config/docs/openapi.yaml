@@ -63,6 +63,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DiagnosticsResponse'
+  /diagnostics/reload_watch:
+    get:
+      tags: [Diagnostics]
+      operationId: diagnosticsReloadWatch
+      summary: Reload watch diagnostics
+      responses:
+        '200':
+          description: Current reload watch settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReloadWatchResponse'
   /adapters:
     get:
       tags: [Adapters]
@@ -195,6 +207,19 @@ paths:
       operationId: reloadAutomations
       summary: Reload automations
       description: Reloads automations from disk and atomically swaps the in-memory automation catalog on success.
+      responses:
+        '200':
+          description: Reload result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReloadResponse'
+  /scripts/reload:
+    post:
+      tags: [Scripts]
+      operationId: reloadScripts
+      summary: Reload scripts
+      description: Acknowledges script directory changes and emits scripts reload lifecycle events.
       responses:
         '200':
           description: Reload result
@@ -1098,7 +1123,7 @@ components:
           enum: [ok, error]
         target:
           type: string
-          enum: [scenes, automations]
+          enum: [scenes, automations, scripts]
         loaded_count:
           type: integer
         errors:
@@ -1108,6 +1133,28 @@ components:
         duration_ms:
           type: integer
           format: int64
+    ReloadWatchItem:
+      type: object
+      required: [target, enabled, directory]
+      properties:
+        target:
+          type: string
+          enum: [scenes, automations, scripts]
+        enabled:
+          type: boolean
+        directory:
+          type: string
+    ReloadWatchResponse:
+      type: object
+      required: [status, watches]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        watches:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReloadWatchItem'
     DeviceHistoryEntry:
       type: object
       required: [observed_at, device]

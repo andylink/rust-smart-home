@@ -250,6 +250,7 @@ Notes:
 - in-flight scene/automation executions continue on their current Lua context
 - new executions after a successful reload use the new catalog
 - if reload validation fails, the previous catalog remains active
+- `POST /scripts/reload` acknowledges script changes and emits scripts reload events
 
 Reload lifecycle events are published to the runtime event bus and WebSocket
 `/events` stream:
@@ -260,6 +261,26 @@ Reload lifecycle events are published to the runtime event bus and WebSocket
 - `automation.catalog_reload_started`
 - `automation.catalog_reloaded`
 - `automation.catalog_reload_failed`
+- `scripts.reload_started`
+- `scripts.reloaded`
+- `scripts.reload_failed`
+
+## Optional Watch Mode
+
+`config/default.toml` supports optional watch flags:
+
+- `[scenes] watch = false`
+- `[automations] watch = false`
+- `[scripts] watch = false`
+
+When enabled for a target, saving `.lua` files under that directory triggers a
+debounced reload using the same validation and swap pipeline as manual reload
+endpoints.
+
+Recommended operations guidance:
+
+- keep `watch = false` in production unless you explicitly need live authoring
+- use manual reload endpoints as the default operational flow
 
 ## Scenes
 

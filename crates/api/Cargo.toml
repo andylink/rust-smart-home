@@ -9,6 +9,7 @@ axum = { version = "0.8", features = ["json", "ws", "tokio"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+notify = "8"
 smart-home-adapters = { path = "../adapters" }
 smart-home-automations = { path = "../automations" }
 smart-home-core = { path = "../core" }

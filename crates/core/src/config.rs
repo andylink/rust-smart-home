@@ -82,18 +82,24 @@ pub struct HistoryConfig {
 pub struct ScenesConfig {
     pub enabled: bool,
     pub directory: String,
+    #[serde(default)]
+    pub watch: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct AutomationsConfig {
     pub enabled: bool,
     pub directory: String,
+    #[serde(default)]
+    pub watch: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ScriptsConfig {
     pub enabled: bool,
     pub directory: String,
+    #[serde(default)]
+    pub watch: bool,
 }
 
 impl Default for ScenesConfig {
@@ -101,6 +107,7 @@ impl Default for ScenesConfig {
         Self {
             enabled: true,
             directory: "config/scenes".to_string(),
+            watch: false,
         }
     }
 }
@@ -127,6 +134,7 @@ impl Default for AutomationsConfig {
         Self {
             enabled: true,
             directory: "config/automations".to_string(),
+            watch: false,
         }
     }
 }
@@ -136,6 +144,7 @@ impl Default for ScriptsConfig {
         Self {
             enabled: true,
             directory: "config/scripts".to_string(),
+            watch: false,
         }
     }
 }

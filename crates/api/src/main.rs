@@ -15,6 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use notify::{EventKind as NotifyEventKind, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use smart_home_adapters as _;
@@ -39,6 +40,7 @@ use smart_home_scenes::{
     SceneCatalog, SceneExecutionResult, SceneRunOutcome, SceneRunner, SceneSummary,
 };
 use store_sql::{HistorySelection, SqliteDeviceStore, SqliteHistoryConfig};
+use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::Level;
@@ -155,7 +157,11 @@ struct AppState {
     automations_enabled: bool,
     scenes_directory: String,
     automations_directory: String,
-    scripts_root: Option<PathBuf>,
+    scenes_watch: bool,
+    automations_watch: bool,
+    scripts_watch: bool,
+    scripts_enabled: bool,
+    scripts_directory: String,
 }
 
 #[derive(Clone)]
@@ -184,6 +190,49 @@ struct ReloadResponse {
     loaded_count: usize,
     errors: Vec<ReloadErrorDetail>,
     duration_ms: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ReloadTarget {
+    Scenes,
+    Automations,
+    Scripts,
+}
+
+#[derive(Clone)]
+struct ReloadController {
+    scenes_enabled: bool,
+    automations_enabled: bool,
+    scripts_enabled: bool,
+    scenes_directory: String,
+    automations_directory: String,
+    scripts_directory: String,
+    scenes: Arc<RwLock<SceneRunner>>,
+    automations: Arc<RwLock<Arc<AutomationCatalog>>>,
+    automation_control: Arc<RwLock<Arc<AutomationController>>>,
+    automation_runner_tx: watch::Sender<AutomationRunner>,
+    automation_observer: Option<Arc<dyn AutomationExecutionObserver>>,
+    store: Option<Arc<dyn DeviceStore>>,
+    trigger_context: TriggerContext,
+    runtime: Arc<Runtime>,
+}
+
+struct ReloadOutcome {
+    loaded_count: usize,
+    duration_ms: u128,
+}
+
+#[derive(Debug, Serialize)]
+struct ReloadWatchResponse {
+    status: &'static str,
+    watches: Vec<ReloadWatchItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReloadWatchItem {
+    target: &'static str,
+    enabled: bool,
+    directory: String,
 }
 
 type BuiltAdapters = (Vec<Box<dyn Adapter>>, Vec<String>);
@@ -669,30 +718,44 @@ async fn main() -> Result<()> {
     );
     let automation_control = Arc::new(automation_runner.controller());
     let (automation_runner_tx, automation_runner_rx) = watch::channel(automation_runner.clone());
-
-    let app = app(
-        AppState {
-            runtime: runtime.clone(),
-            scenes: Arc::new(RwLock::new(scenes)),
-            automations: Arc::new(RwLock::new(automations.clone())),
-            automation_control: Arc::new(RwLock::new(automation_control.clone())),
-            automation_runner_tx,
-            automation_observer: automation_observer.clone(),
-            trigger_context,
-            health: health.clone(),
-            store: device_store.clone(),
-            history: HistorySettings::from_config(&config),
-            scenes_enabled: config.scenes.enabled,
-            automations_enabled: config.automations.enabled,
-            scenes_directory: config.scenes.directory.clone(),
-            automations_directory: config.automations.directory.clone(),
-            scripts_root: config
-                .scripts
-                .enabled
-                .then(|| PathBuf::from(&config.scripts.directory)),
-        },
-        &config,
-    );
+    let app_state = AppState {
+        runtime: runtime.clone(),
+        scenes: Arc::new(RwLock::new(scenes)),
+        automations: Arc::new(RwLock::new(automations.clone())),
+        automation_control: Arc::new(RwLock::new(automation_control.clone())),
+        automation_runner_tx,
+        automation_observer: automation_observer.clone(),
+        trigger_context,
+        health: health.clone(),
+        store: device_store.clone(),
+        history: HistorySettings::from_config(&config),
+        scenes_enabled: config.scenes.enabled,
+        automations_enabled: config.automations.enabled,
+        scenes_directory: config.scenes.directory.clone(),
+        automations_directory: config.automations.directory.clone(),
+        scenes_watch: config.scenes.watch,
+        automations_watch: config.automations.watch,
+        scripts_watch: config.scripts.watch,
+        scripts_enabled: config.scripts.enabled,
+        scripts_directory: config.scripts.directory.clone(),
+    };
+    let app = app(app_state.clone(), &config);
+    let reload_controller = ReloadController {
+        scenes_enabled: config.scenes.enabled,
+        automations_enabled: config.automations.enabled,
+        scripts_enabled: config.scripts.enabled,
+        scenes_directory: config.scenes.directory.clone(),
+        automations_directory: config.automations.directory.clone(),
+        scripts_directory: config.scripts.directory.clone(),
+        scenes: app_state.scenes.clone(),
+        automations: app_state.automations.clone(),
+        automation_control: app_state.automation_control.clone(),
+        automation_runner_tx: app_state.automation_runner_tx.clone(),
+        automation_observer: app_state.automation_observer.clone(),
+        store: app_state.store.clone(),
+        trigger_context,
+        runtime: runtime.clone(),
+    };
     let listener = tokio::net::TcpListener::bind(&config.api.bind_address)
         .await
         .with_context(|| format!("failed to bind API listener on {}", config.api.bind_address))?;
@@ -755,6 +818,8 @@ async fn main() -> Result<()> {
         })
     };
 
+    let watcher_task = spawn_reload_watchers_if_enabled(&config, reload_controller.clone());
+
     health.mark_startup_complete();
 
     axum::serve(listener, app)
@@ -769,6 +834,11 @@ async fn main() -> Result<()> {
 
     automation_task.abort();
     let _ = automation_task.await;
+
+    if let Some(task) = watcher_task {
+        task.abort();
+        let _ = task.await;
+    }
 
     if let Some(task) = persistence_task {
         if let Some(shutdown) = persistence_shutdown_tx.take() {
@@ -956,7 +1026,14 @@ fn make_state(
         automations_enabled,
         scenes_directory,
         automations_directory,
-        scripts_root,
+        scenes_watch: false,
+        automations_watch: false,
+        scripts_watch: false,
+        scripts_enabled: scripts_root.is_some(),
+        scripts_directory: scripts_root
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default(),
     }
 }
 
@@ -966,6 +1043,371 @@ fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
 
 fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     lock.write().unwrap_or_else(|p| p.into_inner())
+}
+
+fn scripts_root_from_controller(controller: &ReloadController) -> Option<PathBuf> {
+    controller
+        .scripts_enabled
+        .then(|| PathBuf::from(&controller.scripts_directory))
+}
+
+fn reload_controller_from_state(state: &AppState) -> ReloadController {
+    ReloadController {
+        scenes_enabled: state.scenes_enabled,
+        automations_enabled: state.automations_enabled,
+        scripts_enabled: state.scripts_enabled,
+        scenes_directory: state.scenes_directory.clone(),
+        automations_directory: state.automations_directory.clone(),
+        scripts_directory: state.scripts_directory.clone(),
+        scenes: state.scenes.clone(),
+        automations: state.automations.clone(),
+        automation_control: state.automation_control.clone(),
+        automation_runner_tx: state.automation_runner_tx.clone(),
+        automation_observer: state.automation_observer.clone(),
+        store: state.store.clone(),
+        trigger_context: state.trigger_context,
+        runtime: state.runtime.clone(),
+    }
+}
+
+fn scripts_loaded_count(controller: &ReloadController) -> usize {
+    match std::fs::read_dir(&controller.scripts_directory) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.path().is_file()
+                    && entry.path().extension().and_then(|ext| ext.to_str()) == Some("lua")
+            })
+            .count(),
+        Err(_) => 0,
+    }
+}
+
+fn reload_response_from_result(
+    target: &'static str,
+    result: std::result::Result<ReloadOutcome, Vec<ReloadErrorDetail>>,
+) -> ReloadResponse {
+    match result {
+        Ok(outcome) => ReloadResponse {
+            status: "ok",
+            target,
+            loaded_count: outcome.loaded_count,
+            errors: Vec::new(),
+            duration_ms: outcome.duration_ms,
+        },
+        Err(errors) => ReloadResponse {
+            status: "error",
+            target,
+            loaded_count: 0,
+            errors,
+            duration_ms: 0,
+        },
+    }
+}
+
+fn reload_scenes_internal(
+    controller: &ReloadController,
+) -> std::result::Result<ReloadOutcome, Vec<ReloadErrorDetail>> {
+    if !controller.scenes_enabled {
+        return Err(vec![ReloadErrorDetail {
+            file: controller.scenes_directory.clone(),
+            message: "scene reload is not supported when scenes are disabled".to_string(),
+        }]);
+    }
+
+    let started = Instant::now();
+    controller
+        .runtime
+        .bus()
+        .publish(Event::SceneCatalogReloadStarted);
+    match SceneCatalog::reload_from_directory(
+        &controller.scenes_directory,
+        scripts_root_from_controller(controller),
+    ) {
+        Ok(catalog) => {
+            let loaded_count = catalog.summaries().len();
+            let duration_ms = started.elapsed().as_millis() as u64;
+            let mut runner = write_lock(&controller.scenes);
+            *runner = SceneRunner::new(catalog);
+            controller
+                .runtime
+                .bus()
+                .publish(Event::SceneCatalogReloaded {
+                    loaded_count,
+                    duration_ms,
+                });
+            Ok(ReloadOutcome {
+                loaded_count,
+                duration_ms: duration_ms as u128,
+            })
+        }
+        Err(errors) => {
+            let duration_ms = started.elapsed().as_millis() as u64;
+            controller
+                .runtime
+                .bus()
+                .publish(Event::SceneCatalogReloadFailed {
+                    duration_ms,
+                    errors: errors
+                        .iter()
+                        .map(|error| smart_home_core::event::ReloadError {
+                            file: error.file.clone(),
+                            message: error.message.clone(),
+                        })
+                        .collect(),
+                });
+            Err(errors
+                .into_iter()
+                .map(|error| ReloadErrorDetail {
+                    file: error.file,
+                    message: error.message,
+                })
+                .collect())
+        }
+    }
+}
+
+fn reload_automations_internal(
+    controller: &ReloadController,
+) -> std::result::Result<ReloadOutcome, Vec<ReloadErrorDetail>> {
+    if !controller.automations_enabled {
+        return Err(vec![ReloadErrorDetail {
+            file: controller.automations_directory.clone(),
+            message: "automation reload is not supported when automations are disabled".to_string(),
+        }]);
+    }
+
+    let started = Instant::now();
+    controller
+        .runtime
+        .bus()
+        .publish(Event::AutomationCatalogReloadStarted);
+
+    let previous_controller = {
+        let guard = read_lock(&controller.automation_control);
+        guard.clone()
+    };
+    let previous_enabled = previous_controller
+        .summaries()
+        .into_iter()
+        .filter_map(|summary| {
+            previous_controller
+                .is_enabled(&summary.id)
+                .map(|enabled| (summary.id, enabled))
+        })
+        .collect::<Vec<_>>();
+
+    match AutomationCatalog::reload_from_directory(
+        &controller.automations_directory,
+        scripts_root_from_controller(controller),
+    ) {
+        Ok(catalog) => {
+            for (id, enabled) in previous_enabled {
+                if catalog.get(&id).is_some() {
+                    let _ = catalog.set_enabled(&id, enabled);
+                }
+            }
+
+            let loaded_count = catalog.summaries().len();
+            let duration_ms = started.elapsed().as_millis() as u64;
+            let runner = build_automation_runner(
+                catalog.clone(),
+                controller.automation_observer.clone(),
+                controller.store.clone(),
+                controller.trigger_context,
+            );
+            let next_controller = Arc::new(runner.controller());
+
+            {
+                let mut catalog_guard = write_lock(&controller.automations);
+                *catalog_guard = Arc::new(catalog);
+            }
+            {
+                let mut controller_guard = write_lock(&controller.automation_control);
+                *controller_guard = next_controller;
+            }
+
+            if controller.automation_runner_tx.send(runner).is_err() {
+                tracing::warn!("automation reload completed but no active runner supervisor was available to receive the updated runner");
+            }
+            controller
+                .runtime
+                .bus()
+                .publish(Event::AutomationCatalogReloaded {
+                    loaded_count,
+                    duration_ms,
+                });
+
+            Ok(ReloadOutcome {
+                loaded_count,
+                duration_ms: duration_ms as u128,
+            })
+        }
+        Err(errors) => {
+            let duration_ms = started.elapsed().as_millis() as u64;
+            controller
+                .runtime
+                .bus()
+                .publish(Event::AutomationCatalogReloadFailed {
+                    duration_ms,
+                    errors: errors
+                        .iter()
+                        .map(|error| smart_home_core::event::ReloadError {
+                            file: error.file.clone(),
+                            message: error.message.clone(),
+                        })
+                        .collect(),
+                });
+            Err(errors
+                .into_iter()
+                .map(|error| ReloadErrorDetail {
+                    file: error.file,
+                    message: error.message,
+                })
+                .collect())
+        }
+    }
+}
+
+fn reload_scripts_internal(
+    controller: &ReloadController,
+) -> std::result::Result<ReloadOutcome, Vec<ReloadErrorDetail>> {
+    if !controller.scripts_enabled {
+        return Err(vec![ReloadErrorDetail {
+            file: controller.scripts_directory.clone(),
+            message: "scripts reload is not supported when scripts are disabled".to_string(),
+        }]);
+    }
+
+    let started = Instant::now();
+    controller
+        .runtime
+        .bus()
+        .publish(Event::ScriptsReloadStarted);
+    if let Err(error) = std::fs::read_dir(&controller.scripts_directory) {
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let errors = vec![ReloadErrorDetail {
+            file: controller.scripts_directory.clone(),
+            message: format!("failed to read scripts directory: {error}"),
+        }];
+        controller
+            .runtime
+            .bus()
+            .publish(Event::ScriptsReloadFailed {
+                duration_ms,
+                errors: errors
+                    .iter()
+                    .map(|error| smart_home_core::event::ReloadError {
+                        file: error.file.clone(),
+                        message: error.message.clone(),
+                    })
+                    .collect(),
+            });
+        return Err(errors);
+    }
+
+    let loaded_count = scripts_loaded_count(controller);
+    let duration_ms = started.elapsed().as_millis() as u64;
+    controller.runtime.bus().publish(Event::ScriptsReloaded {
+        loaded_count,
+        duration_ms,
+    });
+    Ok(ReloadOutcome {
+        loaded_count,
+        duration_ms: duration_ms as u128,
+    })
+}
+
+async fn run_reload_target(controller: ReloadController, target: ReloadTarget) {
+    let result = tokio::task::spawn_blocking(move || match target {
+        ReloadTarget::Scenes => reload_scenes_internal(&controller),
+        ReloadTarget::Automations => reload_automations_internal(&controller),
+        ReloadTarget::Scripts => reload_scripts_internal(&controller),
+    })
+    .await;
+
+    if let Err(error) = result {
+        tracing::warn!("reload task join error: {error}");
+    }
+}
+
+fn spawn_reload_watchers_if_enabled(
+    config: &Config,
+    controller: ReloadController,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !config.scenes.watch && !config.automations.watch && !config.scripts.watch {
+        return None;
+    }
+
+    let mut watched = Vec::<(String, ReloadTarget)>::new();
+    if config.scenes.watch {
+        watched.push((config.scenes.directory.clone(), ReloadTarget::Scenes));
+    }
+    if config.automations.watch {
+        watched.push((
+            config.automations.directory.clone(),
+            ReloadTarget::Automations,
+        ));
+    }
+    if config.scripts.watch {
+        watched.push((config.scripts.directory.clone(), ReloadTarget::Scripts));
+    }
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<ReloadTarget>();
+    let watched_map = watched.clone();
+    let mut watcher =
+        match notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+            let Ok(event) = result else {
+                return;
+            };
+            let trigger = matches!(
+                event.kind,
+                NotifyEventKind::Create(_)
+                    | NotifyEventKind::Modify(_)
+                    | NotifyEventKind::Remove(_)
+            );
+            if !trigger {
+                return;
+            }
+            for path in event.paths {
+                if path.extension().and_then(|ext| ext.to_str()) != Some("lua") {
+                    continue;
+                }
+                for (dir, target) in &watched_map {
+                    if path.starts_with(std::path::Path::new(dir)) {
+                        let _ = tx.send(*target);
+                        return;
+                    }
+                }
+            }
+        }) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                tracing::warn!("failed to start reload watcher: {error}");
+                return None;
+            }
+        };
+
+    for (dir, _) in &watched {
+        if let Err(error) = watcher.watch(std::path::Path::new(dir), RecursiveMode::Recursive) {
+            tracing::warn!("failed to watch directory '{}': {error}", dir);
+        }
+    }
+
+    Some(tokio::spawn(async move {
+        let _watcher = watcher;
+        let mut last = HashMap::<ReloadTarget, Instant>::new();
+        while let Some(target) = rx.recv().await {
+            let now = Instant::now();
+            if let Some(previous) = last.get(&target) {
+                if now.duration_since(*previous) < Duration::from_millis(400) {
+                    continue;
+                }
+            }
+            last.insert(target, now);
+            run_reload_target(controller.clone(), target).await;
+        }
+    }))
 }
 
 async fn monitor_runtime_health(runtime: Arc<Runtime>, health: HealthState) {
@@ -1174,6 +1616,9 @@ async fn run_persistence_worker(
                 | Event::AutomationCatalogReloadStarted
                 | Event::AutomationCatalogReloaded { .. }
                 | Event::AutomationCatalogReloadFailed { .. }
+                | Event::ScriptsReloadStarted
+                | Event::ScriptsReloaded { .. }
+                | Event::ScriptsReloadFailed { .. }
                 | Event::SystemError { .. },
             ) => {}
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -1315,10 +1760,12 @@ fn app(state: AppState, config: &Config) -> Router {
         .route("/adapters/{id}", get(get_adapter))
         .route("/capabilities", get(list_capabilities))
         .route("/diagnostics", get(diagnostics))
+        .route("/diagnostics/reload_watch", get(reload_watch_diagnostics))
         .route("/scenes", get(list_scenes))
         .route("/scenes/reload", post(reload_scenes))
         .route("/automations", get(list_automations))
         .route("/automations/reload", post(reload_automations))
+        .route("/scripts/reload", post(reload_scripts))
         .route("/automations/{id}", get(get_automation))
         .route("/automations/{id}/enabled", post(set_automation_enabled))
         .route("/automations/{id}/validate", post(validate_automation))
@@ -1456,73 +1903,41 @@ async fn diagnostics(State(state): State<AppState>) -> Json<DiagnosticsResponse>
     })
 }
 
+async fn reload_watch_diagnostics(State(state): State<AppState>) -> Json<ReloadWatchResponse> {
+    Json(ReloadWatchResponse {
+        status: "ok",
+        watches: vec![
+            ReloadWatchItem {
+                target: "scenes",
+                enabled: state.scenes_watch,
+                directory: state.scenes_directory.clone(),
+            },
+            ReloadWatchItem {
+                target: "automations",
+                enabled: state.automations_watch,
+                directory: state.automations_directory.clone(),
+            },
+            ReloadWatchItem {
+                target: "scripts",
+                enabled: state.scripts_watch,
+                directory: state.scripts_directory.clone(),
+            },
+        ],
+    })
+}
+
 async fn list_scenes(State(state): State<AppState>) -> Json<Vec<SceneSummary>> {
     let runner = read_lock(&state.scenes);
     Json(runner.summaries())
 }
 
 async fn reload_scenes(State(state): State<AppState>) -> Result<Json<ReloadResponse>, ApiError> {
-    if !state.scenes_enabled {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "scene reload is not supported when scenes are disabled",
-        ));
-    }
+    let controller = reload_controller_from_state(&state);
 
-    let started = Instant::now();
-    let scripts_root = state.scripts_root.clone();
-    state
-        .runtime
-        .bus()
-        .publish(Event::SceneCatalogReloadStarted);
-    match SceneCatalog::reload_from_directory(&state.scenes_directory, scripts_root) {
-        Ok(catalog) => {
-            let loaded_count = catalog.summaries().len();
-            let duration_ms = started.elapsed().as_millis() as u64;
-            let mut runner = write_lock(&state.scenes);
-            *runner = SceneRunner::new(catalog);
-            state.runtime.bus().publish(Event::SceneCatalogReloaded {
-                loaded_count,
-                duration_ms,
-            });
-            Ok(Json(ReloadResponse {
-                status: "ok",
-                target: "scenes",
-                loaded_count,
-                errors: Vec::new(),
-                duration_ms: duration_ms as u128,
-            }))
-        }
-        Err(errors) => {
-            let duration_ms = started.elapsed().as_millis() as u64;
-            state
-                .runtime
-                .bus()
-                .publish(Event::SceneCatalogReloadFailed {
-                    duration_ms,
-                    errors: errors
-                        .iter()
-                        .map(|error| smart_home_core::event::ReloadError {
-                            file: error.file.clone(),
-                            message: error.message.clone(),
-                        })
-                        .collect(),
-                });
-            Ok(Json(ReloadResponse {
-                status: "error",
-                target: "scenes",
-                loaded_count: 0,
-                errors: errors
-                    .into_iter()
-                    .map(|error| ReloadErrorDetail {
-                        file: error.file,
-                        message: error.message,
-                    })
-                    .collect(),
-                duration_ms: duration_ms as u128,
-            }))
-        }
-    }
+    let result = tokio::task::spawn_blocking(move || reload_scenes_internal(&controller))
+        .await
+        .map_err(|error| internal_api_error(anyhow::anyhow!(error.to_string())))?;
+    Ok(Json(reload_response_from_result("scenes", result)))
 }
 
 async fn list_automations(
@@ -1542,109 +1957,21 @@ async fn list_automations(
 async fn reload_automations(
     State(state): State<AppState>,
 ) -> Result<Json<ReloadResponse>, ApiError> {
-    if !state.automations_enabled {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "automation reload is not supported when automations are disabled",
-        ));
-    }
+    let controller = reload_controller_from_state(&state);
 
-    let started = Instant::now();
-    let scripts_root = state.scripts_root.clone();
-    state
-        .runtime
-        .bus()
-        .publish(Event::AutomationCatalogReloadStarted);
-    let previous_controller = {
-        let controller = read_lock(&state.automation_control);
-        controller.clone()
-    };
-    let previous_enabled = previous_controller
-        .summaries()
-        .into_iter()
-        .filter_map(|summary| {
-            previous_controller
-                .is_enabled(&summary.id)
-                .map(|enabled| (summary.id, enabled))
-        })
-        .collect::<Vec<_>>();
+    let result = tokio::task::spawn_blocking(move || reload_automations_internal(&controller))
+        .await
+        .map_err(|error| internal_api_error(anyhow::anyhow!(error.to_string())))?;
+    Ok(Json(reload_response_from_result("automations", result)))
+}
 
-    match AutomationCatalog::reload_from_directory(&state.automations_directory, scripts_root) {
-        Ok(catalog) => {
-            for (id, enabled) in previous_enabled {
-                if catalog.get(&id).is_some() {
-                    let _ = catalog.set_enabled(&id, enabled);
-                }
-            }
+async fn reload_scripts(State(state): State<AppState>) -> Result<Json<ReloadResponse>, ApiError> {
+    let controller = reload_controller_from_state(&state);
 
-            let loaded_count = catalog.summaries().len();
-            let duration_ms = started.elapsed().as_millis() as u64;
-            let runner = build_automation_runner(
-                catalog.clone(),
-                state.automation_observer.clone(),
-                state.store.clone(),
-                state.trigger_context,
-            );
-            let controller = Arc::new(runner.controller());
-
-            {
-                let mut catalog_guard = write_lock(&state.automations);
-                *catalog_guard = Arc::new(catalog);
-            }
-            {
-                let mut controller_guard = write_lock(&state.automation_control);
-                *controller_guard = controller;
-            }
-
-            if state.automation_runner_tx.send(runner).is_err() {
-                tracing::warn!("automation reload completed but no active runner supervisor was available to receive the updated runner");
-            }
-            state
-                .runtime
-                .bus()
-                .publish(Event::AutomationCatalogReloaded {
-                    loaded_count,
-                    duration_ms,
-                });
-
-            Ok(Json(ReloadResponse {
-                status: "ok",
-                target: "automations",
-                loaded_count,
-                errors: Vec::new(),
-                duration_ms: duration_ms as u128,
-            }))
-        }
-        Err(errors) => {
-            let duration_ms = started.elapsed().as_millis() as u64;
-            state
-                .runtime
-                .bus()
-                .publish(Event::AutomationCatalogReloadFailed {
-                    duration_ms,
-                    errors: errors
-                        .iter()
-                        .map(|error| smart_home_core::event::ReloadError {
-                            file: error.file.clone(),
-                            message: error.message.clone(),
-                        })
-                        .collect(),
-                });
-            Ok(Json(ReloadResponse {
-                status: "error",
-                target: "automations",
-                loaded_count: 0,
-                errors: errors
-                    .into_iter()
-                    .map(|error| ReloadErrorDetail {
-                        file: error.file,
-                        message: error.message,
-                    })
-                    .collect(),
-                duration_ms: duration_ms as u128,
-            }))
-        }
-    }
+    let result = tokio::task::spawn_blocking(move || reload_scripts_internal(&controller))
+        .await
+        .map_err(|error| internal_api_error(anyhow::anyhow!(error.to_string())))?;
+    Ok(Json(reload_response_from_result("scripts", result)))
 }
 
 async fn get_automation(
@@ -2737,6 +3064,33 @@ fn event_to_frame(event: Event) -> serde_json::Value {
             json!({
                 "type": "automation.catalog_reload_failed",
                 "target": "automations",
+                "loaded_count": 0,
+                "duration_ms": duration_ms,
+                "errors": errors
+            })
+        }
+        Event::ScriptsReloadStarted => {
+            json!({ "type": "scripts.reload_started", "target": "scripts" })
+        }
+        Event::ScriptsReloaded {
+            loaded_count,
+            duration_ms,
+        } => {
+            json!({
+                "type": "scripts.reloaded",
+                "target": "scripts",
+                "loaded_count": loaded_count,
+                "duration_ms": duration_ms,
+                "errors": []
+            })
+        }
+        Event::ScriptsReloadFailed {
+            duration_ms,
+            errors,
+        } => {
+            json!({
+                "type": "scripts.reload_failed",
+                "target": "scripts",
                 "loaded_count": 0,
                 "duration_ms": duration_ms,
                 "errors": errors
@@ -4347,7 +4701,11 @@ mod tests {
                 automations_enabled: true,
                 scenes_directory: String::new(),
                 automations_directory: automation_dir.to_string_lossy().to_string(),
-                scripts_root: None,
+                scenes_watch: false,
+                automations_watch: false,
+                scripts_watch: false,
+                scripts_enabled: false,
+                scripts_directory: String::new(),
             },
             &config,
         );
@@ -4488,7 +4846,11 @@ mod tests {
                 automations_enabled: true,
                 scenes_directory: String::new(),
                 automations_directory: automation_dir.to_string_lossy().to_string(),
-                scripts_root: None,
+                scenes_watch: false,
+                automations_watch: false,
+                scripts_watch: false,
+                scripts_enabled: false,
+                scripts_directory: String::new(),
             },
             &config,
         );
@@ -4636,6 +4998,20 @@ mod tests {
         assert!(automation_body["status"] == "ok" || automation_body["status"] == "error");
         assert!(automation_body["duration_ms"].is_number());
 
+        let scripts_reload = client
+            .post(format!("http://{addr}/scripts/reload"))
+            .send()
+            .await
+            .expect("scripts reload request succeeds");
+        assert_eq!(scripts_reload.status(), StatusCode::OK);
+        let scripts_body = scripts_reload
+            .json::<Value>()
+            .await
+            .expect("scripts reload json body");
+        assert_eq!(scripts_body["target"], "scripts");
+        assert!(scripts_body["status"] == "ok" || scripts_body["status"] == "error");
+        assert!(scripts_body["duration_ms"].is_number());
+
         let _ = shutdown.send(());
         handle.await.expect("server task completes");
     }
@@ -4744,7 +5120,11 @@ mod tests {
                 automations_enabled: false,
                 scenes_directory: String::new(),
                 automations_directory: String::new(),
-                scripts_root: None,
+                scenes_watch: false,
+                automations_watch: false,
+                scripts_watch: false,
+                scripts_enabled: false,
+                scripts_directory: String::new(),
             },
             &config,
         );
@@ -5246,7 +5626,11 @@ mod tests {
                 automations_enabled: false,
                 scenes_directory: scene_dir.to_string_lossy().to_string(),
                 automations_directory: String::new(),
-                scripts_root: None,
+                scenes_watch: false,
+                automations_watch: false,
+                scripts_watch: false,
+                scripts_enabled: false,
+                scripts_directory: String::new(),
             },
             &config,
         );
@@ -5670,6 +6054,66 @@ mod tests {
             .expect("valid second websocket JSON");
         assert_eq!(second_payload["type"], "scene.catalog_reloaded");
         assert_eq!(second_payload["target"], "scenes");
+
+        drop(socket);
+        let _ = shutdown.send(());
+        handle.await.expect("server task completes");
+    }
+
+    #[tokio::test]
+    async fn websocket_emits_scripts_reload_lifecycle_events() {
+        let scripts_dir = std::env::temp_dir().join(format!(
+            "smart-home-api-scripts-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&scripts_dir).expect("scripts dir created");
+        std::fs::write(scripts_dir.join("helpers.lua"), "return { ok = true }")
+            .expect("script file created");
+
+        let mut config = test_config(serde_json::Map::new());
+        config.scripts.enabled = true;
+        config.scripts.directory = scripts_dir.to_string_lossy().to_string();
+
+        let runtime = Arc::new(Runtime::new(
+            Vec::new(),
+            RuntimeConfig {
+                event_bus_capacity: 16,
+            },
+        ));
+        let (addr, shutdown, handle) = spawn_test_server_with_config(runtime, config).await;
+
+        let (mut socket, _) = connect_async(format!("ws://{addr}/events"))
+            .await
+            .expect("websocket connects");
+
+        let reload = reqwest::Client::new()
+            .post(format!("http://{addr}/scripts/reload"))
+            .send()
+            .await
+            .expect("scripts reload request succeeds");
+        assert_eq!(reload.status(), StatusCode::OK);
+
+        let first = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("first scripts reload event arrives")
+            .expect("websocket yields first message")
+            .expect("first websocket message valid");
+        let first_payload: Value = serde_json::from_str(first.to_text().expect("text frame"))
+            .expect("valid first websocket JSON");
+        assert_eq!(first_payload["type"], "scripts.reload_started");
+
+        let second = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("second scripts reload event arrives")
+            .expect("websocket yields second message")
+            .expect("second websocket message valid");
+        let second_payload: Value = serde_json::from_str(second.to_text().expect("text frame"))
+            .expect("valid second websocket JSON");
+        assert_eq!(second_payload["type"], "scripts.reloaded");
+        assert_eq!(second_payload["target"], "scripts");
 
         drop(socket);
         let _ = shutdown.send(());
