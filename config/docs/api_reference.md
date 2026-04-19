@@ -20,6 +20,27 @@ allowed_origins = ["http://127.0.0.1:8080"]
 
 Only bare `http` and `https` origins are accepted. Paths, queries, fragments, and wildcard origins are not supported.
 
+## Rate Limiting
+
+Write endpoints (`POST /devices/{id}/command`, `POST /rooms/{id}/command`, `POST /groups/{id}/command`, `POST /scenes/{id}/execute`) are subject to an optional token-bucket rate limiter.
+
+When enabled, requests that exceed the configured rate return:
+
+```
+HTTP 429 Too Many Requests
+```
+
+Rate limiting is controlled via `[api.rate_limit]` in `config/default.toml`:
+
+```toml
+[api.rate_limit]
+enabled = false
+requests_per_second = 100
+burst_size = 20
+```
+
+It is disabled by default. MCP tools and agents that issue many rapid commands should either keep rate limiting disabled or set `requests_per_second` and `burst_size` high enough to avoid 429 responses.
+
 ## Conventions
 
 - request and response bodies are JSON unless stated otherwise
@@ -33,11 +54,8 @@ Only bare `http` and `https` origins are accepted. Paths, queries, fragments, an
 
 Returns current reload watch configuration for scenes, automations, and scripts.
 
-Example:
+Example (uses `adapter-ollama` for `ctx:invoke`; see `crates/adapter-ollama/README.md` for the full `ollama:*` target contract):
 
-```bash
-curl http://127.0.0.1:3000/diagnostics/reload_watch
-```
 
 Response shape:
 
@@ -735,71 +753,7 @@ return {
 
 `ctx:invoke(target, payload_table)` dispatches a service-style call to the adapter that owns the target prefix and returns a Lua value.
 
-Current built-in invoke targets from `adapter-ollama`:
-
-- `ollama:generate`
-- `ollama:vision`
-- `ollama:chat`
-- `ollama:embeddings`
-- `ollama:tags`
-- `ollama:ps`
-- `ollama:show`
-- `ollama:version`
-
-Highlights:
-
-- `ollama:vision` is a convenience wrapper around generate-with-images
-- `ollama:chat` accepts a Lua list in `messages`
-- `ollama:embeddings` accepts a string or Lua list in `input`
-- `ollama:tags`, `ollama:ps`, and `ollama:version` do not require a payload
-
-Example:
-
-```lua
-return {
-  id = "check_clothesline",
-  name = "Check Clothesline",
-  execute = function(ctx)
-    local result = ctx:invoke("ollama:vision", {
-      prompt = "Reply only true or false. Are clothes on the clothesline?",
-      image_base64 = "BASE64_IMAGE_HERE",
-    })
-
-    if result.boolean == true then
-      ctx:command("elgato_lights:light:0", {
-        capability = "power",
-        action = "on",
-      })
-    end
-  end
-}
-```
-
-Chat example:
-
-```lua
-local result = ctx:invoke("ollama:chat", {
-  messages = {
-    {
-      role = "user",
-      content = "Summarize this room state in one sentence.",
-    },
-  },
-})
-
-local reply = result.message.content
-```
-
-Embeddings example:
-
-```lua
-local result = ctx:invoke("ollama:embeddings", {
-  input = {
-    "washer running",
-    "dryer idle",
-  },
-})
-```
+Invoke targets are adapter-defined. Each adapter that supports `ctx:invoke` documents its available targets, payload fields, and response shapes in its own README. For example, `crates/adapter-ollama/README.md` documents the `ollama:*` targets.
 
 ## Automations
 

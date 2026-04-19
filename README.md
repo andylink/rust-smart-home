@@ -6,10 +6,10 @@ Smart Home is a Rust workspace for a local home automation runtime built around:
 - an in-memory device and room registry
 - an HTTP API for inspection and commands
 - a WebSocket event stream for live updates
-- SQLite-backed current-state persistence
+- SQLite-backed current-state and history persistence (PostgreSQL also supported)
 - a factory-based adapter model designed to be easy for humans and agentic AI to extend
 
-This project is moving toward a workflow where agents can safely add adapters, automations, scenes, and eventually Lua-based scripting with MCP tooling layered on top.
+This project supports agentic workflows: agents can safely add adapters, automations, scenes, and Lua-based scripting, with an MCP server (`crates/mcp-server`) available for tool-assisted operations.
 
 ## Read This First
 
@@ -30,6 +30,7 @@ Adapter-specific docs:
 - `crates/adapter-elgato-lights/README.md`
 - `crates/adapter-ollama/README.md`
 - `crates/adapter-roku-tv/README.md`
+- `crates/adapter-zigbee2mqtt/README.md`
 
 External reference examples:
 
@@ -55,10 +56,14 @@ smart-home/
 │   ├── adapter-ollama/
 │   ├── adapter-open-meteo/
 │   ├── adapter-roku-tv/
+│   ├── adapter-zigbee2mqtt/
 │   ├── api/
+│   ├── automations/
 │   ├── core/
+│   ├── lua-host/
 │   ├── scenes/
-│   └── store-sql/
+│   ├── store-sql/
+│   └── store-postgres/
 └── README.md
 ```
 
@@ -68,7 +73,8 @@ smart-home/
 
 - `crates/core` defines the runtime contracts, device model, command model, capability catalog, registry, and event bus.
 - `crates/api` starts the runtime and exposes HTTP and WebSocket interfaces.
-- `crates/store-sql` persists the current state for restart recovery.
+- `crates/store-sql` is the default SQLite persistence backend. Stores current device and room state, full device/attribute history, command audit log, and scene/automation execution history.
+- `crates/store-postgres` is an alternative PostgreSQL backend implementing the same traits. Enable it with `persistence.backend = "postgres"` and a `database_url` in `config/default.toml`.
 
 ### Adapters
 
@@ -103,12 +109,29 @@ This means adapter polls should preserve room assignment rather than overwrite i
 
 ### Persistence
 
-Persistence is current-state only.
+Two backends are supported, both implementing the same `DeviceStore` and `ApiKeyStore` traits:
 
-- latest known rooms are persisted
-- latest known devices are persisted
-- startup hydrates the registry from SQLite before adapters begin polling
-- event history is not stored yet
+**SQLite (default)**
+
+- configured via `persistence.backend = "sqlite"` and `database_url = "sqlite://data/smart-home.db"`
+- schema is created and migrated automatically inside `crates/store-sql`; no external tool needed
+- startup hydrates the registry from stored device and room rows before adapters begin polling
+
+**PostgreSQL**
+
+- configured via `persistence.backend = "postgres"` and `database_url = "postgres://user:pass@host/db"`
+- implemented in `crates/store-postgres`; no TimescaleDB or other extensions required
+- a `docker-compose.yml` ships at the workspace root with a `postgres:16-alpine` service for local use
+
+Both backends store:
+
+- latest known devices and rooms
+- full device and attribute history
+- command audit log
+- scene and automation execution history
+
+Rate limiting on write endpoints is configurable via `[api.rate_limit]` in `config/default.toml`.
+The server handles SIGTERM and ctrl-c and drains in-flight requests with a 30-second timeout before exit.
 
 ## Current Adapters
 
@@ -124,11 +147,12 @@ Persistence is current-state only.
 - type: polled and commandable multi-device adapter
 - exposes one logical light device per physical light index
 
-### Roku TV
+### Roku TV *(bundled example)*
 
 - crate: `crates/adapter-roku-tv`
 - type: polled and commandable single-device adapter
 - currently exposes power control for one TV using a static IP
+- **bundled as an example adapter** — not part of the official supported set
 
 ## Configuration
 
@@ -153,16 +177,17 @@ Default config lives at:
 
 Current default config includes:
 
-- `scenes`
-- `open_meteo`
-- `elgato_lights`
-- `roku_tv`
+- `open_meteo` (official)
+- `elgato_lights` (official)
+- `zigbee2mqtt` (official)
+- `roku_tv` (bundled example)
+- `ollama` (bundled example)
 
 The default asset layout is:
 
 - `config/scenes/` for structured Lua scenes
-- `config/automations/` reserved for future automation assets
-- `config/scripts/` reserved for future free-form Lua scripts
+- `config/automations/` for event-driven Lua automations
+- `config/scripts/` for shared Lua helper modules (`require`-able from scenes and automations)
 
 ## Running The API
 
@@ -362,10 +387,16 @@ local result = ctx:invoke("ollama:chat", {
 local reply = result.message.content
 ```
 
-Automations live in `config/automations/` and support two trigger types in the first pass:
+Automations live in `config/automations/` and support these trigger types:
 
-- `device_state_change`
-- `interval`
+- `device_state_change` — fires when a device attribute changes
+- `weather_state` — fires when a weather sensor crosses a threshold
+- `adapter_lifecycle` — fires when an adapter starts or stops
+- `system_error` — fires on any system error event
+- `wall_clock` — fires at a specific time of day
+- `cron` — fires on a cron expression schedule
+- `sunrise` / `sunset` — fires at computed solar events for the configured location
+- `interval` — fires repeatedly on a fixed time interval
 
 Automation example:
 
@@ -457,6 +488,5 @@ This project is intended to grow in these areas:
 - automations
 - scenes
 - scripting through Lua
-- MCP-assisted project operations
 
 The current adapter factory model is the foundation for that work.
