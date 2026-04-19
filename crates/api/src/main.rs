@@ -49,7 +49,6 @@ use store_sql::{HistorySelection, SqliteDeviceStore, SqliteHistoryConfig};
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use tracing::Level;
 
@@ -2242,16 +2241,12 @@ fn app(state: AppState, config: &Config) -> Router {
             })
         });
 
-    let mut router = Router::new()
+    let router = Router::new()
         .merge(public_routes)
         .merge(read_routes)
         .merge(write_routes)
         .merge(admin_routes)
         .merge(automation_routes);
-
-    if config.dashboard.enabled {
-        router = router.nest_service("/dashboard", ServeDir::new(&config.dashboard.directory));
-    }
 
     router
         .layer(cors_layer(config))
@@ -3516,24 +3511,46 @@ async fn handle_events_socket(mut socket: WebSocket, runtime: Arc<Runtime>) {
     let mut receiver = runtime.bus().subscribe();
 
     loop {
-        let frame = match receiver.recv().await {
-            Ok(Event::DeviceSeen { .. }) => continue,
-            Ok(event) => event_to_frame(event),
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                json!({
-                    "type": "system.error",
-                    "message": "subscriber lagged, events dropped"
-                })
+        tokio::select! {
+            // Drive the socket reader so that ping frames get answered and
+            // close frames are detected promptly.
+            msg = socket.recv() => {
+                match msg {
+                    // Client closed the connection or stream ended.
+                    None => break,
+                    // Received a close frame — acknowledge and stop.
+                    Some(Ok(Message::Close(_))) => break,
+                    // Any error on the receive side means the connection is gone.
+                    Some(Err(_)) => break,
+                    // Ping/pong/text/binary frames from the client are ignored;
+                    // tungstenite automatically replies to pings when the stream
+                    // is driven via recv().
+                    Some(Ok(_)) => continue,
+                }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-        };
 
-        if socket
-            .send(Message::Text(frame.to_string().into()))
-            .await
-            .is_err()
-        {
-            break;
+            // Forward events from the internal bus to the client.
+            bus_result = receiver.recv() => {
+                let frame = match bus_result {
+                    Ok(Event::DeviceSeen { .. }) => continue,
+                    Ok(event) => event_to_frame(event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        json!({
+                            "type": "system.error",
+                            "message": "subscriber lagged, events dropped"
+                        })
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+
+                if socket
+                    .send(Message::Text(frame.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
         }
     }
 }
@@ -4377,7 +4394,6 @@ mod tests {
             auth: smart_home_core::config::AuthConfig {
                 master_key: TEST_MASTER_KEY.to_string(),
             },
-            dashboard: smart_home_core::config::DashboardConfig::default(),
         }
     }
 

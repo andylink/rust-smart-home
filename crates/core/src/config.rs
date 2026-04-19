@@ -29,8 +29,6 @@ pub struct Config {
     pub adapters: AdaptersConfig,
     #[serde(default)]
     pub auth: AuthConfig,
-    #[serde(default)]
-    pub dashboard: DashboardConfig,
 }
 
 pub type AdapterConfig = serde_json::Value;
@@ -272,22 +270,6 @@ impl Default for AuthConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct DashboardConfig {
-    pub enabled: bool,
-    #[serde(default = "default_dashboard_directory")]
-    pub directory: String,
-}
-
-impl Default for DashboardConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            directory: default_dashboard_directory(),
-        }
-    }
-}
-
 impl Config {
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -407,10 +389,6 @@ impl Config {
             bail!("auth.master_key must not be empty");
         }
 
-        if self.dashboard.enabled && self.dashboard.directory.trim().is_empty() {
-            bail!("dashboard.directory is required when dashboard is enabled");
-        }
-
         Ok(())
     }
 }
@@ -433,10 +411,6 @@ fn default_history_max_query_limit() -> usize {
 
 fn default_master_key() -> String {
     "change-me-in-production".to_string()
-}
-
-fn default_dashboard_directory() -> String {
-    "config/dashboard".to_string()
 }
 
 fn default_rate_limit_requests_per_second() -> u64 {

@@ -1,39 +1,51 @@
 # Dashboard Template Guide
 
-This guide describes the recommended pattern for building small external dashboards against the Smart Home API.
+This project provides a **Smart Home API**. Dashboards are external clients that you build and own.
 
-The reference implementation lives in:
+The reference example lives in `examples/dashboard-template/` and is the canonical starting point for users and AI / MCP agents building dashboards against this API.
 
-- `examples/dashboard-template/`
+## Design Philosophy
 
-http://127.0.0.1:8080/examples/dashboard-template/?api=http://127.0.0.1:3001
+The API binary (`crates/api`) deliberately does not serve a dashboard. Keeping the API separate from any frontend means:
 
-## Why The Dashboard Lives Outside `crates/api`
+- The API surface stays stable and client-agnostic
+- Dashboards can be built in any language or framework without touching the backend
+- AI / MCP tooling can treat the HTTP + WebSocket contract as the stable interface and generate or modify dashboard code without needing to understand the Rust codebase
 
-`crates/api` should remain focused on runtime startup plus the HTTP and WebSocket system contract.
+## The Reference Example
 
-The dashboard template is intentionally external so that:
+`examples/dashboard-template/` is a no-build, no-npm single-page dashboard using:
 
-- the API stays lean and reusable
-- UI experiments do not expand the backend surface area
-- AI or MCP tooling can treat the API as the stable contract and generate dashboards separately
+- **Alpine.js** for reactive state management and DOM templating
+- **Vanilla CSS** with custom properties for theming
+- **No build tooling** — serve the directory as static files
 
-## Minimal Dashboard Contract
+Structure:
 
-The reference template uses only two runtime interfaces:
-
-1. filtered `GET /devices`
-2. WebSocket `GET /events`
-
-Example filtered request:
-
-```text
-GET /devices?ids=open_meteo:temperature_outdoor&ids=open_meteo:wind_speed&ids=open_meteo:wind_direction
+```
+examples/dashboard-template/
+├── index.html              HTML shell + all card templates
+├── css/
+│   ├── base.css            Design tokens (colours, spacing, type scale)
+│   ├── layout.css          App shell, header, responsive grid
+│   └── components.css      All component styles
+├── js/
+│   ├── utils.js            Formatting helpers, URL utilities
+│   ├── api.js              HTTP client — createApiClient()
+│   ├── websocket.js        WS manager — createWebSocketManager()
+│   └── app.js              Alpine component — smartHomeApp()
+└── README.md
 ```
 
-This allows a dashboard to fetch only the devices it needs without adding dashboard-specific API endpoints.
+## Running the Example Locally
 
-For browser-based dashboards served from another origin, enable explicit API CORS origins in `config/default.toml`:
+Start the API:
+
+```bash
+cargo run -p api
+```
+
+Enable CORS for the origin you will serve the dashboard from (edit `config/default.toml`):
 
 ```toml
 [api.cors]
@@ -41,71 +53,125 @@ enabled = true
 allowed_origins = ["http://127.0.0.1:8080"]
 ```
 
-The API keeps CORS disabled by default.
+Serve the dashboard (from the repository root):
 
-For the reference template in `examples/dashboard-template/`, the usual local pairing is:
+```bash
+python -m http.server 8080
+```
 
-- dashboard: `http://127.0.0.1:8080`
-- API: `http://127.0.0.1:3001`
+Open:
 
-## Recommended Frontend Pattern
+```
+http://127.0.0.1:8080/examples/dashboard-template/?api=http://127.0.0.1:3001&token=your-key
+```
 
-Use this flow:
+## Authentication
 
-1. pick the canonical device IDs needed for the UI
-2. bootstrap current state with filtered `GET /devices`
-3. normalize device payloads into local UI state
-4. connect to `/events`
-5. update only the affected local state when matching `device.state_changed` events arrive
+All API routes except `GET /health` and `GET /ready` require a `Bearer` token.
 
-This keeps the UI small, fast, and aligned with the live runtime model.
+In the dashboard, the token is:
+1. Read from the `?token=` query parameter on load, or
+2. Entered via the setup screen and stored in `localStorage`
 
-## Weather Example
+The HTTP client in `js/api.js` injects it as `Authorization: Bearer <token>` on every request. The WebSocket appends it as `?token=<token>` on the connection URL.
 
-The template tracks these devices:
+## API Contract Used by the Dashboard
+
+### Initial data load
+
+```
+GET /rooms
+GET /devices
+GET /scenes
+```
+
+### Device commands
+
+```
+POST /devices/{id}/command
+Content-Type: application/json
+
+{ "capability": "power",      "action": "on" }
+{ "capability": "brightness", "action": "set", "value": 75 }
+{ "capability": "color_temperature", "action": "set", "value": { "value": 4000, "unit": "kelvin" } }
+```
+
+Capabilities present on a device are determined by the attributes in the `GET /devices` response. Only show controls for capabilities that exist.
+
+### Scene execution
+
+```
+POST /scenes/{id}/execute
+```
+
+### Live event stream
+
+```
+WS /events?token=<token>
+```
+
+Event types the dashboard handles:
+
+| Type | Action taken |
+|------|-------------|
+| `device.state_changed` | Re-fetch all devices |
+| `device.added` | Re-fetch all devices |
+| `device.removed` | Re-fetch all devices |
+| Others | Appended to the Events feed |
+
+## Weather / Sensor Devices
+
+The `open_meteo` adapter ships with the project and provides read-only weather data. Its device IDs are:
 
 - `open_meteo:temperature_outdoor`
 - `open_meteo:wind_speed`
 - `open_meteo:wind_direction`
 
-The current device shapes are:
+Attribute shapes:
 
-- `temperature_outdoor`: measurement object with `value` and `unit`
-- `wind_speed`: measurement object with `value` and `unit`
-- `wind_direction`: numeric integer direction in degrees
+| Device | Attribute key | Value shape |
+|--------|--------------|-------------|
+| `temperature_outdoor` | `temperature_outdoor` | `{ value: float, unit: "celsius" }` |
+| `wind_speed` | `wind_speed` | `{ value: float, unit: "km/h" }` |
+| `wind_direction` | `wind_direction` | `integer` (degrees) |
 
-## Guidance For AI Or MCP Dashboard Generation
+## Controllable Devices (Lights, Switches, etc.)
 
-When generating a new dashboard against this repo:
+The `elgato_lights` and `zigbee2mqtt` adapters provide controllable devices. No specific devices are bundled with the project — the dashboard discovers them at runtime via `GET /devices` and renders controls based on which capability attributes are present.
 
-1. treat `config/docs/api_reference.md` as the API contract
-2. discover candidate device IDs from `GET /devices`
-3. prefer filtered `GET /devices?ids=...` over fetching the full registry when the UI only needs a subset
-4. subscribe to `/events` for live updates instead of polling
-5. map canonical device attributes into a small view model before rendering
-6. keep adapter-specific assumptions isolated to the chosen device IDs and attribute keys
+| Attribute present | Control shown |
+|-------------------|--------------|
+| `power` | Power toggle button |
+| `brightness` | Slider 1–100 |
+| `color_temperature` | Slider 2200–7000 K |
 
-## Extension Ideas
+Device IDs follow the namespace format `{adapter_name}:{vendor_id}`.
 
-The same pattern can be extended to:
+## Guidance for AI / MCP Agents
 
-- room summaries
-- lighting dashboards
-- power and energy widgets
-- media transport views
-- diagnostics panels
+When generating or extending a dashboard against this API:
 
-As the UI grows, keep following the same rule:
+1. Treat `config/docs/api_reference.md` as the authoritative API contract
+2. Discover devices and their capabilities with `GET /devices` — do not hardcode capability assumptions except for known adapters
+3. Use `GET /devices?ids=id1&ids=id2` (filtered) when the dashboard only needs specific devices
+4. Subscribe to `WS /events` for live updates instead of polling
+5. Normalise device attributes into local UI state before rendering — avoid computing display values inside templates
+6. Keep adapter-specific assumptions isolated to known device IDs and attribute keys (e.g. open_meteo sensor IDs)
+7. Add new API calls in `js/api.js`, new state in `js/app.js`, new card HTML in `index.html`, new styles in `css/components.css`
 
-- use the existing API contract first
-- only extend the API when the new shape is broadly reusable across clients
+To verify the dashboard is working correctly after changes:
+- `GET /health` should return 200
+- `GET /devices` with a valid token should return the device list
+- The WebSocket at `ws://127.0.0.1:3001/events?token=...` should connect and stream events
 
-## Reference Stack
+## CORS
 
-The example uses:
+The API does not allow cross-origin requests by default. For any dashboard served from a different origin, add that origin to `config/default.toml`:
 
-- static HTML
-- Alpine.js for local state and WebSocket updates
-- htmx included as part of the lightweight reference stack
+```toml
+[api.cors]
+enabled = true
+allowed_origins = ["http://127.0.0.1:8080"]
+```
 
-The initial template avoids a build system on purpose so that future agents can inspect and adapt it quickly.
+Origins must be bare (scheme + host + optional port) with no path, query, or trailing slash.

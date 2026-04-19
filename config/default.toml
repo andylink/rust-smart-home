@@ -69,10 +69,6 @@ enabled = true
 directory = "config/scripts"
 watch = false
 
-[dashboard]
-enabled = true
-directory = "config/dashboard"
-
 [telemetry]
 enabled = false
 
